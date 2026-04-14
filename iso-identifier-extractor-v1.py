@@ -921,14 +921,18 @@ class ISOLineAssociator(TargetedPatchExtractor):
     def has_colored_lines(self, img_rgb: np.ndarray) -> bool:
         """
         Fast scan: return True if the patch contains >= 50 colorful
-        (non-grayscale, non-black, non-white) pixels.
-        Patches that are purely black-on-white P&ID drawings are skipped
-        instantly without running OCR.
+        (non-grayscale, non-black) pixels.
+
+        NOTE: The upper V ceiling was intentionally removed.  Yellow ISO lines
+        have V≈255 in HSV (pure bright yellow), so `v < 240` would silently
+        exclude every yellow pixel, causing entire yellow-line patches to be
+        skipped.  White pixels are already filtered by their S≈0 (they fail
+        the s > 40 check), so no upper V bound is needed.
         """
         img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
         s = img_hsv[:, :, 1]
         v = img_hsv[:, :, 2]
-        colorful_count = int(np.sum((s > 50) & (v > 30) & (v < 240)))
+        colorful_count = int(np.sum((s > 40) & (v > 30)))
         return colorful_count >= 50
 
     def get_color_mask(self, img_rgb: np.ndarray, target_rgb: tuple) -> np.ndarray:
@@ -943,7 +947,10 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         s_min = max(20, int(target_s * self.color_s_min_ratio))
         v_min = 25
-        v_max = 245
+        # No hard ceiling on V: bright yellows (and other saturated light colours)
+        # have V=255.  White is excluded by s_min (white has S≈0), so there is
+        # no risk of false-positives from near-white pixels.
+        v_max = 255
 
         h_low  = (target_h - self.color_h_tol) % 180
         h_high = (target_h + self.color_h_tol) % 180
@@ -992,21 +999,28 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 return True
         return False
 
-    def detect_color_proximity_masks(self, img_rgb: np.ndarray) -> Dict[str, np.ndarray]:
+    def _build_color_masks(
+        self, img_rgb: np.ndarray
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """
-        For every ISO line color present in the legend, build a dilated binary
-        mask.  An ISO color is only included if:
+        Build raw and dilated binary masks for every ISO line color present
+        in this patch.
+
+        An ISO color is included only if:
           1. Its raw mask has >= self.min_color_pixels matching pixels, AND
           2. Those pixels form at least one line-like connected component
              (span >= self.min_line_span_px in one axis) — filters noise blobs.
 
-        The dilation of `proximity_px` converts the raw line mask into a
-        proximity zone so that nearby text bboxes will overlap it.
+        Returns:
+            raw_masks       : undilated pixel masks  {iso_name: mask}
+            proximity_masks : dilated masks           {iso_name: mask}
+              (proximity_masks are kept for the edge-extension association step)
         """
         kernel = np.ones(
             (self.proximity_px * 2 + 1, self.proximity_px * 2 + 1),
             np.uint8,
         )
+        raw_masks:       Dict[str, np.ndarray] = {}
         proximity_masks: Dict[str, np.ndarray] = {}
 
         for iso_name, color_info in self.iso_color_map.items():
@@ -1017,19 +1031,25 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
             if pixel_count < self.min_color_pixels:
                 print(f"      [COLOR] {iso_name:<22} {color_info['hex']}  "
-                      f"pixels={pixel_count:4d} → SKIP (below threshold {self.min_color_pixels})")
+                      f"pixels={pixel_count:4d} → SKIP (< {self.min_color_pixels} px)")
                 continue
 
             if not self._has_line_structure(raw_mask):
                 print(f"      [COLOR] {iso_name:<22} {color_info['hex']}  "
-                      f"pixels={pixel_count:4d} → SKIP (no line structure — scattered noise)")
+                      f"pixels={pixel_count:4d} → SKIP (scattered noise, no line)")
                 continue
 
             dilated = cv2.dilate(raw_mask, kernel, iterations=1)
+            raw_masks[iso_name]       = raw_mask
             proximity_masks[iso_name] = dilated
             print(f"      [COLOR] {iso_name:<22} {color_info['hex']}  "
                   f"pixels={pixel_count:4d} → ACCEPTED")
 
+        return raw_masks, proximity_masks
+
+    # Legacy wrapper kept for any external callers
+    def detect_color_proximity_masks(self, img_rgb: np.ndarray) -> Dict[str, np.ndarray]:
+        _, proximity_masks = self._build_color_masks(img_rgb)
         return proximity_masks
 
     # ------------------------------------------------------------------
@@ -1039,13 +1059,24 @@ class ISOLineAssociator(TargetedPatchExtractor):
     def find_nearest_iso_line(
         self,
         bbox: tuple,
-        proximity_masks: Dict[str, np.ndarray],
+        raw_masks: Dict[str, np.ndarray],
         img_h: int,
         img_w: int,
     ) -> Optional[str]:
         """
-        Return the ISO line name whose proximity mask overlaps the most with
-        `bbox`.  Returns None if no mask overlaps by at least min_overlap_px.
+        Return the ISO line name whose drawn pixels are geometrically closest
+        to the centre of `bbox`.
+
+        WHY distance-to-centroid instead of max dilated-mask overlap:
+          The previous approach (most overlap in dilated mask) failed when two
+          ISO lines were both near the text — the one with a broader or denser
+          dilated blob won regardless of which line the text actually labels.
+          Euclidean distance to the nearest raw line pixel is unambiguous: the
+          identifier text is always placed next to ITS own line, so the correct
+          ISO color's pixels will always be closest.
+
+        Returns None if the nearest line pixel is farther than
+        proximity_px * 6 (generous to handle text placed slightly off the line).
         """
         x1 = max(0, int(bbox[0]))
         y1 = max(0, int(bbox[1]))
@@ -1055,17 +1086,35 @@ class ISOLineAssociator(TargetedPatchExtractor):
         if x2 <= x1 or y2 <= y1:
             return None
 
-        best_iso = None
-        best_overlap = 0
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        max_dist = self.proximity_px * 6  # e.g., 72 px at default proximity_px=12
 
-        for iso_name, prox_mask in proximity_masks.items():
-            roi = prox_mask[y1:y2, x1:x2]
-            overlap = int(np.sum(roi > 0))
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_iso = iso_name
+        best_iso  = None
+        best_dist = float('inf')
+        candidates = []
 
-        return best_iso if best_overlap >= self.min_overlap_px else None
+        for iso_name, raw_mask in raw_masks.items():
+            ys, xs = np.where(raw_mask > 0)
+            if len(xs) == 0:
+                continue
+            dists    = np.sqrt((xs.astype(float) - cx) ** 2 +
+                               (ys.astype(float) - cy) ** 2)
+            min_dist = float(np.min(dists))
+            candidates.append((iso_name, min_dist))
+            if min_dist < best_dist:
+                best_dist = min_dist
+                best_iso  = iso_name
+
+        # Diagnostic: log all candidates so wrong associations are visible
+        if candidates:
+            cand_str = "  ".join(
+                f"{n}={d:.1f}px" for n, d in sorted(candidates, key=lambda x: x[1])
+            )
+            print(f"      [ASSOC] bbox=({x1},{y1})-({x2},{y2})  cx={cx:.0f},cy={cy:.0f}  "
+                  f"candidates: {cand_str}")
+
+        return best_iso if best_dist <= max_dist else None
 
     # ------------------------------------------------------------------
     # OCR with bbox tracking
@@ -1107,7 +1156,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
         patch_path: Path,
         current_patch: np.ndarray,
         partials_info: List[dict],
-        proximity_masks: Dict[str, np.ndarray],
+        raw_masks: Dict[str, np.ndarray],
         img_h: int,
         img_w: int,
     ) -> List[Tuple[str, str, dict]]:
@@ -1116,7 +1165,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
         the neighbouring patch to recover the complete identifier (same logic as
         TargetedPatchExtractor.process_extensions), then associate each complete
         identifier with the nearest ISO line using the *current* patch's
-        proximity masks and the partial's *original* bbox.
+        raw (undilated) color masks and the partial's *original* bbox.
 
         Returns list of (identifier, iso_line_name, color_info).
         """
@@ -1153,8 +1202,8 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 continue
 
             for identifier in complete_ids:
-                # Use the partial's original bbox for colour proximity check
-                iso_line = self.find_nearest_iso_line(bbox, proximity_masks, img_h, img_w)
+                # Use the partial's original bbox for distance-based ISO line lookup
+                iso_line = self.find_nearest_iso_line(bbox, raw_masks, img_h, img_w)
                 if iso_line:
                     color_info = self.iso_color_map[iso_line]
                     results.append((identifier, iso_line, color_info))
@@ -1196,12 +1245,12 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         print(f"\n  [PROCESS] {patch_path.name}")
 
-        # ── Step 2: proximity masks ──────────────────────────────────────
-        proximity_masks = self.detect_color_proximity_masks(img_rgb)
-        if not proximity_masks:
+        # ── Step 2: build raw + proximity masks ──────────────────────────
+        raw_masks, proximity_masks = self._build_color_masks(img_rgb)
+        if not raw_masks:
             print(f"    No legend colors matched in patch")
             return []
-        print(f"    Colors present: {list(proximity_masks.keys())}")
+        print(f"    Colors present: {list(raw_masks.keys())}")
 
         # ── Step 3: OCR with bbox map ────────────────────────────────────
         identifier_bbox_map, texts_with_bboxes = self.run_ocr_with_bbox_map(patch)
@@ -1209,9 +1258,9 @@ class ISOLineAssociator(TargetedPatchExtractor):
         associations: List[Tuple[str, str, dict]] = []
         seen_ids: Set[str] = set()
 
-        # ── Step 4: associate complete identifiers ───────────────────────
+        # ── Step 4: associate complete identifiers (distance-based) ──────
         for identifier, bbox in identifier_bbox_map.items():
-            iso_line = self.find_nearest_iso_line(bbox, proximity_masks, img_h, img_w)
+            iso_line = self.find_nearest_iso_line(bbox, raw_masks, img_h, img_w)
             if iso_line:
                 color_info = self.iso_color_map[iso_line]
                 associations.append((identifier, iso_line, color_info))
@@ -1220,6 +1269,8 @@ class ISOLineAssociator(TargetedPatchExtractor):
                     f"    ✓ {identifier} → {iso_line} "
                     f"({color_info.get('pattern', '?')}, {color_info['hex']})"
                 )
+            else:
+                print(f"    ✗ {identifier} → no ISO line within range")
 
         # ── Step 5: partial identifiers at patch edges ───────────────────
         partials_info: List[dict] = []
@@ -1239,7 +1290,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
         if partials_info:
             ext_assoc = self.process_extensions_with_associations(
                 patch_path, patch, partials_info,
-                proximity_masks, img_h, img_w,
+                raw_masks, img_h, img_w,
             )
             # Only add if not already found as a direct complete match
             for identifier, iso_line, color_info in ext_assoc:
