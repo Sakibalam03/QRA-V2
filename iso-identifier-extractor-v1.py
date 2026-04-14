@@ -748,30 +748,104 @@ def _hue_cluster_median(colorful_pixels: np.ndarray, min_count: int = 6) -> Opti
     return tuple(np.median(colorful_pixels[in_cluster], axis=0).astype(int))
 
 
+def find_color_sample_column(
+    img_rgb: np.ndarray,
+    min_sat: int = 80,
+    min_v: int = 40,
+    max_v: int = 252,
+    min_colorful_rows: int = 4,
+    merge_gap: int = 8,
+) -> Tuple[int, int]:
+    """
+    Locate the X column range in the legend image that contains the ISO line
+    colour samples.
+
+    The colour sample column (e.g. "Node Legend" in a GBN EPIC legend table)
+    is the only column where MANY different rows each contain a distinct
+    colourful horizontal segment.  All other columns are either:
+      • Black text on white background  (not colourful)
+      • A lightly-tinted header/HAZOP background  (low saturation, filtered
+        out by min_sat=80 because those backgrounds are typically S ≈ 30-55)
+
+    Algorithm:
+      1. Build a per-X-column count of how many Y-rows have at least one
+         pixel with S > min_sat and min_v < V < max_v.
+      2. Find contiguous X-bands where that count >= min_colorful_rows.
+      3. Return the widest such band.  Falls back to (0, image_width) if
+         nothing is found.
+    """
+    img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    h_img, w_img = img_hsv.shape[:2]
+
+    s = img_hsv[:, :, 1]   # (h, w)
+    v = img_hsv[:, :, 2]   # (h, w)
+    colorful_mask = (s > min_sat) & (v > min_v) & (v < max_v)   # (h, w) bool
+
+    # For each X column, how many rows contain at least one colourful pixel?
+    row_hits = colorful_mask.any(axis=1)            # (h,) bool per row
+    col_colorful_rows = colorful_mask.sum(axis=0)   # (w,) int — count per col
+
+    active = col_colorful_rows >= min_colorful_rows  # (w,) bool
+
+    # Merge small gaps so a dashed line doesn't split into many tiny blocks
+    active_merged = active.copy()
+    for i in range(w_img - merge_gap):
+        if active[i] and active[i + merge_gap]:
+            active_merged[i:i + merge_gap] = True
+
+    # Collect contiguous blocks
+    blocks: List[Tuple[int, int]] = []
+    in_block = False
+    bstart = 0
+    for i in range(w_img):
+        if active_merged[i] and not in_block:
+            bstart, in_block = i, True
+        elif not active_merged[i] and in_block:
+            blocks.append((bstart, i))
+            in_block = False
+    if in_block:
+        blocks.append((bstart, w_img))
+
+    if not blocks:
+        print("  [COL] No colourful column band found — using full width")
+        return 0, w_img
+
+    # Pick the widest block (most X columns with consistently colourful rows)
+    blocks.sort(key=lambda b: b[1] - b[0], reverse=True)
+    best_x1, best_x2 = blocks[0]
+    print(f"  [COL] Colour-sample column detected: x={best_x1}-{best_x2} "
+          f"({best_x2 - best_x1}px wide,  {int(col_colorful_rows[best_x1:best_x2].max())} peak rows)")
+    return best_x1, best_x2
+
+
 def dominant_color_in_row(
     img_rgb: np.ndarray,
     row_y1: int, row_y2: int,
-    exclude_x1: int, exclude_x2: int,
+    exclude_x1: int = 0,
+    exclude_x2: int = 0,
     min_count: int = 6,
-    min_density: float = 0.05,
-    max_search_px: int = 250,
+    min_density: float = 0.01,
 ) -> Optional[Tuple]:
     """
-    Find the ISO line colour sample adjacent to a legend text label.
+    Find the ISO line colour sample in a legend row by scanning the FULL
+    row width.
 
-    WHY bounded search (not full-row):
-      In two-column legends the two entries on the same row each have their
-      own colour sample.  A full-row scan sees BOTH samples and picks the
-      dominant one, which is consistently the WRONG column's colour.
-      Bounding the search to ±max_search_px from the label edges keeps each
-      entry inside its own column's territory.
+    WHY no X exclusion:
+      The legend is a table where the colored line sample is a GRAPHICAL
+      element in a dedicated column.  The surrounding text is black, which
+      is filtered out by _colorful_pixels_in_region (brightness and
+      color_diff checks).  Restricting the X search range to outside the
+      text bbox silently excludes the color sample when the OCR text bbox
+      spans the full row width (which happens whenever the row text fills
+      the image width).  Scanning the full width and relying on the
+      colorfulness filter is simpler and more reliable.
 
-    Strategy:
-      1. Search RIGHT:  [exclude_x2 + 5 … exclude_x2 + max_search_px]
-      2. Search LEFT:   [exclude_x1 - max_search_px … exclude_x1 - 5]
-      3. Collect colorful pixels from each side; compute density.
-      4. Pick the side with the HIGHER colorful-pixel density.
-      5. Return the median RGB of the dominant hue cluster on that side.
+    WHY tight Y bounds (no expansion):
+      The legend rows are densely packed.  Expanding Y bleeds colorful
+      pixels from adjacent rows into the current row's scan, causing
+      colour swaps between entries (e.g. CPP-03 ↔ CPP-13).  Y bounds
+      are kept strict: the caller passes (y1, y2) of the matched text
+      line with zero expansion.
     """
     h_img, w_img = img_rgb.shape[:2]
     row_y1 = max(0, row_y1)
@@ -779,35 +853,21 @@ def dominant_color_in_row(
     if row_y2 <= row_y1:
         return None
 
-    candidates = []   # list of (density, colorful_pixels_array, side_label)
-
-    # ── Right side ────────────────────────────────────────────────────────
-    rx1 = min(exclude_x2 + 5, w_img)
-    rx2 = min(exclude_x2 + max_search_px, w_img)
-    if rx2 > rx1:
-        cp = _colorful_pixels_in_region(img_rgb, row_y1, row_y2, rx1, rx2)
-        total = (row_y2 - row_y1) * (rx2 - rx1)
-        density = len(cp) / total if total > 0 else 0.0
-        if len(cp) >= min_count and density >= min_density:
-            candidates.append((density, cp, 'right'))
-
-    # ── Left side ─────────────────────────────────────────────────────────
-    lx1 = max(0, exclude_x1 - max_search_px)
-    lx2 = max(0, exclude_x1 - 5)
-    if lx2 > lx1:
-        cp = _colorful_pixels_in_region(img_rgb, row_y1, row_y2, lx1, lx2)
-        total = (row_y2 - row_y1) * (lx2 - lx1)
-        density = len(cp) / total if total > 0 else 0.0
-        if len(cp) >= min_count and density >= min_density:
-            candidates.append((density, cp, 'left'))
-
-    if not candidates:
+    cp = _colorful_pixels_in_region(img_rgb, row_y1, row_y2, 0, w_img)
+    if len(cp) < min_count:
         return None
 
-    # Pick the side with the highest colorful-pixel density
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    _, best_pixels, best_side = candidates[0]
-    return _hue_cluster_median(best_pixels, min_count=min_count)
+    total   = (row_y2 - row_y1) * w_img
+    density = len(cp) / total if total > 0 else 0.0
+    if density < min_density:
+        return None
+
+    color = _hue_cluster_median(cp, min_count=min_count)
+    if color is not None:
+        print(f"    [LEGEND] row y={row_y1}-{row_y2}  "
+              f"colorful_px={len(cp)}  density={density:.3f}  "
+              f"hex={rgb_to_hex(color)}")
+    return color
 
 
 def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=False):
@@ -867,7 +927,21 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
                     continue
             bbox = line.bbox
             x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
-            iso_boxes.append((iso_name, (x1, y1, x2, y2)))
+
+            # Estimate x2 of the matched ISO name only (not the full line).
+            # OCR text-line bboxes often span the ENTIRE table row
+            # (ISO name + description + colour sample + Yes/No column), so
+            # x2 ends up near the image midpoint and all four right-side
+            # search regions start AFTER the colour-sample column.
+            # Scaling x2 by the character-count ratio of the matched name
+            # puts region-1 (x2_est+5 … x2_est+150) right over the sample.
+            if len(text) > len(iso_name):
+                char_end_ratio = (match.start() + len(iso_name)) / len(text)
+                x2_est = int(x1 + char_end_ratio * (x2 - x1))
+            else:
+                x2_est = x2
+
+            iso_boxes.append((iso_name, (x1, y1, x2_est, y2)))
 
     print(f"  Matched {len(iso_boxes)} ISO identifiers in legend\n")
 
@@ -876,45 +950,100 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
         debug_img = img.copy()
 
     for iso_name, (x1, y1, x2, y2) in iso_boxes:
-        # ── Full-row dominant-colour extraction ──────────────────────────
-        # We scan the ENTIRE ROW height (±5 px to catch lines slightly off
-        # the text baseline) while EXCLUDING the label text X-range.
-        # The dominant hue cluster in that row is the ISO line colour.
-        # This is layout-agnostic (left/right sample) and immune to
-        # neighbour-row bleed because each entry's Y window is independent.
-        expand_y    = 5
-        row_y1      = max(0, y1 - expand_y)
-        row_y2      = min(h, y2 + expand_y)
+        # ── Colour extraction: v4-style right-side directional search ─────
+        #
+        # For each ISO text bbox, try several search regions to the RIGHT
+        # of the text and pick the one with the MOST colorful pixels.
+        # This is exactly what iso-legends-extractor-v4 does and it reliably
+        # finds the colour sample column regardless of legend layout.
+        #
+        # WHY not column-restriction:
+        #   The OCR text bbox often spans the full row width, so a fixed
+        #   column boundary derived from the "Node Legend" header can fall
+        #   inside (or outside) the actual colour sample.  Scanning outward
+        #   from x2 of the ISO text and picking the richest region is layout-
+        #   agnostic and matches v4's proven approach.
+        #
+        # WHY strict Y bounds (zero expansion):
+        #   Adjacent legend rows are densely packed.  Even ±6 px of Y
+        #   expansion causes colourful pixels from the row above/below to
+        #   bleed into the current scan.  The wide search region (w*0.5 →
+        #   w-10) in particular spans both CPP-03 and CPP-13 rows when Y is
+        #   loose, swapping their extracted colours.  Strict bounds (exactly
+        #   y1..y2 from the OCR bbox) prevent this.
+        # Search regions: 6 candidates covering the full width.
+        # Region 1-2 start from the proportionally-estimated x2 of the ISO
+        # name text, putting them right over the colour-sample column.
+        # Regions 3-4 sweep the left/center (for entries whose sample is at
+        # x < w/2 — e.g. CPP-09 whose crop shows blank in x(1920-3830)).
+        # Regions 5-6 are the original right-half sweeps from v4.
+        search_regions = [
+            (x2 + 5,        min(x2 + 200, w)),   # just right of ISO name
+            (x2 + 150,      min(x2 + 600, w)),   # wider right of ISO name
+            (int(w * 0.25), int(w * 0.55)),       # left-center sweep
+            (int(w * 0.35), int(w * 0.65)),       # center sweep
+            (int(w * 0.50), w - 10),              # right half (v4)
+            (int(w * 0.60), w - 10),              # rightmost 40% (v4)
+        ]
 
-        avg_color_tuple = dominant_color_in_row(
-            img_rgb,
-            row_y1, row_y2,
-            exclude_x1=x1, exclude_x2=x2,
-        )
+        best_cp       = np.empty((0, 3), dtype=np.uint8)
+        best_vivid_cp = np.empty((0, 3), dtype=np.uint8)
+        best_region   = search_regions[0]
+        best_score    = -1
 
-        # Fallback: if normal search failed, try a wider Y expansion
-        # (handles colour samples placed slightly above/below the text baseline)
-        if avg_color_tuple is None:
-            avg_color_tuple = dominant_color_in_row(
-                img_rgb,
-                max(0, y1 - 15), min(h, y2 + 15),
-                exclude_x1=x1, exclude_x2=x2,
-                min_count=5, min_density=0.03,
-                max_search_px=250,
-            )
+        for sx1, sx2 in search_regions:
+            sx1 = max(0, sx1)
+            sx2 = min(w, sx2)
+            if sx1 >= sx2:
+                continue
+            # Strict Y bounds: exactly y1..y2 — no expansion
+            cp = _colorful_pixels_in_region(img_rgb, y1, y2, sx1, sx2)
+            if len(cp) == 0:
+                continue
+
+            # Score by VIVID pixels (HSV S > 70).
+            # HAZOP table backgrounds are pale (S ≈ 30-55) and score 0,
+            # while actual ISO line samples (S ≥ 80-255) score high.
+            # This prevents the wide sweep from winning due to many pale
+            # background pixels when the colour sample is in a narrow band.
+            cp_arr   = cp.reshape(1, -1, 3).astype(np.uint8)
+            cp_hsv_r = cv2.cvtColor(cp_arr, cv2.COLOR_RGB2HSV).reshape(-1, 3)
+            vivid_mask  = cp_hsv_r[:, 1] > 70
+            vivid_count = int(np.sum(vivid_mask))
+            # Primary sort: vivid pixels; tiebreaker: total colorful pixels
+            score = vivid_count * 100_000 + len(cp)
+            if score > best_score:
+                best_score    = score
+                best_cp       = cp
+                best_vivid_cp = cp[vivid_mask]
+                best_region   = (sx1, sx2)
+
+        # Pass vivid pixels to hue clustering; fall back to all colorful if
+        # the entry uses a genuinely pale colour (e.g. very light lavenders).
+        pixels_for_color = best_vivid_cp if len(best_vivid_cp) >= 5 else best_cp
+        avg_color_tuple  = _hue_cluster_median(pixels_for_color, min_count=5)
 
         if avg_color_tuple is not None:
-            hsv_color = rgb_to_hsv(avg_color_tuple)
+            bx1, bx2 = best_region
+            print(f"    [LEGEND] {iso_name:<15}  "
+                  f"hex={rgb_to_hex(avg_color_tuple)}  "
+                  f"vivid={len(best_vivid_cp)}  px={len(best_cp)}  "
+                  f"region=x({bx1}-{bx2})")
+            hsv_color      = rgb_to_hsv(avg_color_tuple)
             iso_normalized = re.sub(r'\s+', ' ', iso_name.upper())
 
-            # Build a colour-region crop for visual inspection
-            best_color_region = img_rgb[row_y1:row_y2, :, :]
+            # Colour-region crop for pattern detection and optional saving
+            best_color_region = img_rgb[y1:y2, bx1:bx2, :]
             pattern = detect_line_pattern(best_color_region, iso_name)
 
             if save_color_regions:
                 os.makedirs('color_regions', exist_ok=True)
-                region_path = f'color_regions/{iso_normalized.replace("/", "_").replace(" ", "_")}.png'
-                cv2.imwrite(region_path, cv2.cvtColor(best_color_region, cv2.COLOR_RGB2BGR))
+                region_path = (
+                    f'color_regions/'
+                    f'{iso_normalized.replace("/", "_").replace(" ", "_")}.png'
+                )
+                cv2.imwrite(region_path,
+                            cv2.cvtColor(best_color_region, cv2.COLOR_RGB2BGR))
 
             iso_color_map[iso_normalized] = {
                 'rgb':     avg_color_tuple,
@@ -923,7 +1052,8 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
                 'pattern': pattern,
             }
         else:
-            print(f"  ⚠ Could not extract colour for {iso_name} — row had no distinct colorful region")
+            print(f"  ⚠ Could not extract colour for {iso_name} "
+                  f"— row had no distinct colorful region")
 
         if debug:
             cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -964,8 +1094,8 @@ class ISOLineAssociator(TargetedPatchExtractor):
         patch_height: int = 640,
         proximity_px: int = 12,
         min_overlap_px: int = 8,
-        color_h_tol: int = 8,
-        color_s_min_ratio: float = 0.50,
+        color_h_tol: int = 12,
+        color_s_min_ratio: float = 0.40,
         min_color_pixels: int = 30,
         min_line_span_px: int = 15,
     ):
@@ -1065,6 +1195,14 @@ class ISOLineAssociator(TargetedPatchExtractor):
         img_hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
 
         s_min = max(20, int(target_s * self.color_s_min_ratio))
+        # Saturation ceiling: prevents a pale legend colour from matching vivid
+        # lines that belong to a more saturated legend entry with the same hue.
+        # e.g. CPP-13 (S=41) must NOT match the vivid OW lines (S≈150) whose
+        # correct legend entry is CPP-03 (S=116).
+        # Formula: allow up to max(target_s*1.4, target_s+50) so that:
+        #   • pale entries (S≤64) have tight ceilings that exclude vivid pixels
+        #   • vivid entries (S≥120) have generous ceilings (no effective cap)
+        s_max = min(255, max(int(target_s * 1.4), target_s + 50))
         v_min = 25
         # No hard ceiling on V: bright yellows (and other saturated light colours)
         # have V=255.  White is excluded by s_min (white has S≈0), so there is
@@ -1078,19 +1216,19 @@ class ISOLineAssociator(TargetedPatchExtractor):
             mask = cv2.inRange(
                 img_hsv,
                 np.array([h_low,  s_min, v_min]),
-                np.array([h_high, 255,   v_max]),
+                np.array([h_high, s_max, v_max]),
             )
         else:
             # Hue wraps around 0/180
             m1 = cv2.inRange(
                 img_hsv,
                 np.array([h_low, s_min, v_min]),
-                np.array([179,   255,   v_max]),
+                np.array([179,   s_max, v_max]),
             )
             m2 = cv2.inRange(
                 img_hsv,
                 np.array([0,      s_min, v_min]),
-                np.array([h_high, 255,   v_max]),
+                np.array([h_high, s_max, v_max]),
             )
             mask = cv2.bitwise_or(m1, m2)
 
@@ -1166,36 +1304,37 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         return raw_masks, proximity_masks
 
-    # Legacy wrapper kept for any external callers
-    def detect_color_proximity_masks(self, img_rgb: np.ndarray) -> Dict[str, np.ndarray]:
-        _, proximity_masks = self._build_color_masks(img_rgb)
-        return proximity_masks
-
     # ------------------------------------------------------------------
-    # Association logic
+    # Association logic  —  local-colour approach
     # ------------------------------------------------------------------
 
-    def find_nearest_iso_line(
+    def _find_iso_line_by_local_color(
         self,
         bbox: tuple,
-        raw_masks: Dict[str, np.ndarray],
+        img_rgb: np.ndarray,
         img_h: int,
         img_w: int,
     ) -> Optional[str]:
         """
-        Return the ISO line name whose drawn pixels are geometrically closest
-        to the centre of `bbox`.
+        Associate an ISO identifier with a legend entry by sampling the
+        pixels in a small window centred on the identifier bbox, extracting
+        the dominant color, and matching it to the closest legend entry by
+        HSV distance.
 
-        WHY distance-to-centroid instead of max dilated-mask overlap:
-          The previous approach (most overlap in dilated mask) failed when two
-          ISO lines were both near the text — the one with a broader or denser
-          dilated blob won regardless of which line the text actually labels.
-          Euclidean distance to the nearest raw line pixel is unambiguous: the
-          identifier text is always placed next to ITS own line, so the correct
-          ISO color's pixels will always be closest.
+        WHY this replaces the mask-based approach:
+          The previous approach built patch-wide HSV masks for every legend
+          color and found which mask was nearest to the identifier.  When
+          multiple legend entries share the same hue family (e.g. CPP-01/03/13
+          are all reddish), their masks overlap on the SAME line pixels →
+          all equidistant → wrong alphabetical winner.
 
-        Returns None if the nearest line pixel is farther than
-        proximity_px * 6 (generous to handle text placed slightly off the line).
+          Direct color measurement at the identifier location naturally
+          discriminates CPP-03 (vivid coral, S≈116) from CPP-01 (pale salmon,
+          S≈64) from CPP-13 (very pale peach, S≈41) because the HSV distance
+          formula explicitly penalises saturation mismatches.
+
+        Returns None if no colorful pixels are found near the identifier or
+        the best legend match is too dissimilar.
         """
         x1 = max(0, int(bbox[0]))
         y1 = max(0, int(bbox[1]))
@@ -1205,38 +1344,86 @@ class ISOLineAssociator(TargetedPatchExtractor):
         if x2 <= x1 or y2 <= y1:
             return None
 
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-        # Tighter threshold: identifier text must be within ~40 px of the line.
-        # proximity_px=12 → max_dist=40 px.  This rejects identifiers that are
-        # near a coloured area but not physically hugging their own ISO line.
-        max_dist = self.proximity_px * 3 + 4  # e.g., 40 px at proximity_px=12
+        # ── Step 1: sample colorful pixels in an expanding window ────────
+        # Start tight so we only pick up the adjacent line; expand only when
+        # too few colorful pixels are found (handles the case where the line
+        # runs slightly above/below the text bbox).
+        extracted_color: Optional[tuple] = None
+        used_margin = 0
+        for margin in [8, 15, 25, 40]:
+            rx1 = max(0, x1 - margin)
+            rx2 = min(img_w, x2 + margin)
+            ry1 = max(0, y1 - margin)
+            ry2 = min(img_h, y2 + margin)
+            cp = _colorful_pixels_in_region(img_rgb, ry1, ry2, rx1, rx2)
+            if len(cp) >= 8:
+                color = _hue_cluster_median(cp, min_count=8)
+                if color is not None:
+                    extracted_color = color
+                    used_margin     = margin
+                    break
 
-        best_iso  = None
-        best_dist = float('inf')
-        candidates = []
+        if extracted_color is None:
+            print(f"      [LOCAL] no colorful pixels near "
+                  f"bbox ({x1},{y1})-({x2},{y2})")
+            return None
 
-        for iso_name, raw_mask in raw_masks.items():
-            ys, xs = np.where(raw_mask > 0)
-            if len(xs) == 0:
-                continue
-            dists    = np.sqrt((xs.astype(float) - cx) ** 2 +
-                               (ys.astype(float) - cy) ** 2)
-            min_dist = float(np.min(dists))
-            candidates.append((iso_name, min_dist))
-            if min_dist < best_dist:
-                best_dist = min_dist
-                best_iso  = iso_name
+        ex_h, ex_s, ex_v = rgb_to_hsv(extracted_color)
 
-        # Diagnostic: log all candidates so wrong associations are visible
-        if candidates:
-            cand_str = "  ".join(
-                f"{n}={d:.1f}px" for n, d in sorted(candidates, key=lambda x: x[1])
-            )
-            print(f"      [ASSOC] bbox=({x1},{y1})-({x2},{y2})  cx={cx:.0f},cy={cy:.0f}  "
-                  f"candidates: {cand_str}")
+        # ── Step 2: HSV distance to every legend entry ───────────────────
+        # Hue: 3× weight — primary colour identity (0-90 range).
+        # Saturation: 40/255 weight per unit — distinguishes pale vs vivid
+        #   same-hue entries (CPP-01 S=64 vs CPP-03 S=116 vs CPP-13 S=41).
+        # Value: 10/255 weight — minor brightness discriminator.
+        candidates: List[Tuple[str, float]] = []
+        for iso_name, info in self.iso_color_map.items():
+            lg_h, lg_s, lg_v = info['hsv']
+            dh = min(abs(int(ex_h) - int(lg_h)),
+                     180 - abs(int(ex_h) - int(lg_h)))
+            ds = abs(int(ex_s) - int(lg_s)) / 255.0
+            dv = abs(int(ex_v) - int(lg_v)) / 255.0
+            dist = dh * 3.0 + ds * 40.0 + dv * 10.0
+            candidates.append((iso_name, dist))
 
-        return best_iso if best_dist <= max_dist else None
+        candidates.sort(key=lambda c: c[1])
+        best_name, best_dist = candidates[0]
+
+        top5 = "  ".join(f"{n}={d:.1f}" for n, d in candidates[:5])
+        print(f"      [LOCAL] margin={used_margin}px  "
+              f"hex={rgb_to_hex(extracted_color)}  "
+              f"hsv=({ex_h},{ex_s},{ex_v})  top5: {top5}")
+
+        # Reject if even the closest entry is too dissimilar
+        if best_dist > 45.0:
+            print(f"      [LOCAL] → no match (best dist {best_dist:.1f} > 45)")
+            return None
+
+        # ── Step 3: pattern tiebreaker ────────────────────────────────────
+        # When top-2 entries are within 8 distance units (same-color entries
+        # that differ only in pattern, e.g. CPP-02 dashed vs CPP-08 solid),
+        # detect the local line pattern from a horizontal strip around the
+        # identifier and prefer the entry whose legend pattern matches.
+        if len(candidates) >= 2 and (candidates[1][1] - best_dist) < 8.0:
+            cy_mid = (y1 + y2) // 2
+            strip = img_rgb[
+                max(0, cy_mid - 8) : min(img_h, cy_mid + 8),
+                max(0, x1 - 60)   : min(img_w, x2 + 60),
+            ]
+            local_pattern = (detect_line_pattern(strip)
+                             if strip.size > 0 else 'unknown')
+
+            if local_pattern != 'unknown':
+                for name, dist in candidates:
+                    if dist - best_dist < 8.0:
+                        if self.iso_color_map.get(name, {}).get(
+                                'pattern') == local_pattern:
+                            if name != best_name:
+                                print(f"      [LOCAL] pattern '{local_pattern}'"
+                                      f" → prefer {name} over {best_name}")
+                            best_name = name
+                            break
+
+        return best_name
 
     # ------------------------------------------------------------------
     # OCR with bbox tracking
@@ -1277,17 +1464,17 @@ class ISOLineAssociator(TargetedPatchExtractor):
         self,
         patch_path: Path,
         current_patch: np.ndarray,
+        img_rgb: np.ndarray,
         partials_info: List[dict],
-        raw_masks: Dict[str, np.ndarray],
         img_h: int,
         img_w: int,
     ) -> List[Tuple[str, str, dict]]:
         """
         For partial identifiers found near patch edges, stitch in a strip from
-        the neighbouring patch to recover the complete identifier (same logic as
-        TargetedPatchExtractor.process_extensions), then associate each complete
-        identifier with the nearest ISO line using the *current* patch's
-        raw (undilated) color masks and the partial's *original* bbox.
+        the neighbouring patch to recover the complete identifier, then
+        associate via _find_iso_line_by_local_color using the partial's
+        ORIGINAL bbox position in the current patch (the coloured line is
+        always in the current patch, adjacent to where the text starts).
 
         Returns list of (identifier, iso_line_name, color_info).
         """
@@ -1324,8 +1511,11 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 continue
 
             for identifier in complete_ids:
-                # Use the partial's original bbox for distance-based ISO line lookup
-                iso_line = self.find_nearest_iso_line(bbox, raw_masks, img_h, img_w)
+                # Associate using local color at the partial's original bbox
+                # in the current patch (the line is here, not in the extension)
+                iso_line = self._find_iso_line_by_local_color(
+                    bbox, img_rgb, img_h, img_w
+                )
                 if iso_line:
                     color_info = self.iso_color_map[iso_line]
                     results.append((identifier, iso_line, color_info))
@@ -1345,11 +1535,13 @@ class ISOLineAssociator(TargetedPatchExtractor):
     ) -> List[Tuple[str, str, dict]]:
         """
         Full pipeline for one patch:
-          1. Color scan  →  skip if no colored lines
-          2. Build proximity masks for legend colors present in patch
-          3. Run OCR with bbox tracking
-          4. Associate complete identifiers to nearest ISO line
-          5. Handle edge-partial identifiers via extension + association
+          1. Fast color scan  → skip patches with no coloured lines (saves OCR)
+          2. OCR to detect ISO identifiers with their bounding boxes
+          3. For each identifier: sample a small window of pixels around its
+             bbox, extract the dominant colour, match to closest legend entry
+             by HSV distance  (see _find_iso_line_by_local_color)
+          4. Handle partial identifiers at patch edges via neighbour-extension
+             OCR, then associate using the same local-colour approach
 
         Returns list of (identifier, iso_line_name, color_info).
         """
@@ -1367,22 +1559,17 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         print(f"\n  [PROCESS] {patch_path.name}")
 
-        # ── Step 2: build raw + proximity masks ──────────────────────────
-        raw_masks, proximity_masks = self._build_color_masks(img_rgb)
-        if not raw_masks:
-            print(f"    No legend colors matched in patch")
-            return []
-        print(f"    Colors present: {list(raw_masks.keys())}")
-
-        # ── Step 3: OCR with bbox map ────────────────────────────────────
+        # ── Step 2: OCR ──────────────────────────────────────────────────
         identifier_bbox_map, texts_with_bboxes = self.run_ocr_with_bbox_map(patch)
 
         associations: List[Tuple[str, str, dict]] = []
         seen_ids: Set[str] = set()
 
-        # ── Step 4: associate complete identifiers (distance-based) ──────
+        # ── Step 3: associate complete identifiers ────────────────────────
         for identifier, bbox in identifier_bbox_map.items():
-            iso_line = self.find_nearest_iso_line(bbox, raw_masks, img_h, img_w)
+            iso_line = self._find_iso_line_by_local_color(
+                bbox, img_rgb, img_h, img_w
+            )
             if iso_line:
                 color_info = self.iso_color_map[iso_line]
                 associations.append((identifier, iso_line, color_info))
@@ -1392,15 +1579,17 @@ class ISOLineAssociator(TargetedPatchExtractor):
                     f"({color_info.get('pattern', '?')}, {color_info['hex']})"
                 )
             else:
-                print(f"    ✗ {identifier} → no ISO line within range")
+                print(f"    ✗ {identifier} → no match")
 
-        # ── Step 5: partial identifiers at patch edges ───────────────────
+        # ── Step 4: partial identifiers at patch edges ───────────────────
         partials_info: List[dict] = []
         for text, bbox in texts_with_bboxes:
             if any(text in cid for cid in seen_ids):
                 continue
             if self.has_partial_pattern(text):
-                edge, direction = self.determine_edge_and_direction(bbox, img_w, img_h)
+                edge, direction = self.determine_edge_and_direction(
+                    bbox, img_w, img_h
+                )
                 if edge and direction:
                     partials_info.append({
                         'text':      text,
@@ -1411,10 +1600,8 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         if partials_info:
             ext_assoc = self.process_extensions_with_associations(
-                patch_path, patch, partials_info,
-                raw_masks, img_h, img_w,
+                patch_path, patch, img_rgb, partials_info, img_h, img_w,
             )
-            # Only add if not already found as a direct complete match
             for identifier, iso_line, color_info in ext_assoc:
                 if identifier not in seen_ids:
                     associations.append((identifier, iso_line, color_info))
@@ -1475,7 +1662,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 # ============================================================
 
 def main_with_legend():
-    patch_folder = r"C:\Users\saroc\Desktop\P&ID V1 Updated\test-node1.4-patches"
+    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-2"
     legend_path  = input("Enter path to ISO legend image: ").strip().strip("'\"")
     page_name    = input("Enter page name (e.g. ERCP_2): ").strip() or "ERCP_2"
 
