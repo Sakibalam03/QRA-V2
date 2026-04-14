@@ -703,59 +703,28 @@ def hue_to_color_name(hue_opencv: int) -> str:
     return "red"
 
 
-def dominant_color_in_row(
-    img_rgb: np.ndarray,
-    row_y1: int, row_y2: int,
-    exclude_x1: int, exclude_x2: int,
-    min_count: int = 8,
-    min_density: float = 0.06,
-) -> Optional[Tuple]:
+def _colorful_pixels_in_region(
+    img_rgb: np.ndarray, y1: int, y2: int, x1: int, x2: int
+) -> np.ndarray:
+    """Return array of colorful (non-grey, non-black) pixels in the given crop."""
+    crop = img_rgb[y1:y2, x1:x2].reshape(-1, 3).astype(int)
+    if len(crop) == 0:
+        return np.empty((0, 3), dtype=np.uint8)
+    brightness = crop.mean(axis=1)
+    color_diff = crop.max(axis=1) - crop.min(axis=1)
+    mask = (brightness > 30) & (brightness < 248) & (color_diff > 20)
+    return crop[mask].astype(np.uint8)
+
+
+def _hue_cluster_median(colorful_pixels: np.ndarray, min_count: int = 6) -> Optional[Tuple]:
     """
-    Find the dominant ISO-line colour in a horizontal legend row, ignoring
-    the X range [exclude_x1, exclude_x2] (which contains the text label).
-
-    Strategy:
-      1. Collect all colorful pixels in the row (outside the label area).
-      2. Build a hue histogram over those pixels.
-      3. Find the peak hue bin.
-      4. Return the median RGB of pixels in that hue cluster.
-
-    This is layout-agnostic (works whether the colour sample is to the left
-    or right of the label) and immune to neighbour-row bleed (each row is
-    searched independently with its own tight Y window).
+    Given an array of colorful RGB pixels, find the dominant hue cluster
+    (peak of a 36-bin hue histogram) and return the median RGB of that cluster.
+    Returns None if fewer than min_count pixels fall in the peak cluster.
     """
-    h_img, w_img = img_rgb.shape[:2]
-    row_y1 = max(0, row_y1)
-    row_y2 = min(h_img, row_y2)
-    if row_y2 <= row_y1:
+    if len(colorful_pixels) < min_count:
         return None
 
-    # Build a column mask that excludes the label text region
-    col_indices = np.array(
-        [x for x in range(w_img) if not (exclude_x1 <= x <= exclude_x2)]
-    )
-    if len(col_indices) == 0:
-        return None
-
-    row_slice = img_rgb[row_y1:row_y2, :, :]          # shape (h, w, 3)
-    outside   = row_slice[:, col_indices, :]            # shape (h, ncols, 3)
-    pixels    = outside.reshape(-1, 3)                  # shape (N, 3)
-
-    # Filter to colorful pixels only
-    bright     = pixels[:, 0].astype(int)
-    green      = pixels[:, 1].astype(int)
-    blue_ch    = pixels[:, 2].astype(int)
-    brightness = (bright + green + blue_ch) / 3.0
-    color_diff = pixels.max(axis=1).astype(int) - pixels.min(axis=1).astype(int)
-    colorful_mask = (brightness > 30) & (brightness < 245) & (color_diff > 20)
-    colorful_pixels = pixels[colorful_mask]
-
-    count   = len(colorful_pixels)
-    density = count / len(pixels) if len(pixels) > 0 else 0.0
-    if count < min_count or density < min_density:
-        return None
-
-    # Compute hue for each colorful pixel (use OpenCV H 0-180 scale)
     cp_f  = colorful_pixels.astype(np.float32) / 255.0
     r, g, b = cp_f[:, 0], cp_f[:, 1], cp_f[:, 2]
     max_c = np.maximum(np.maximum(r, g), b)
@@ -763,23 +732,82 @@ def dominant_color_in_row(
     delta = max_c - min_c + 1e-9
 
     hue = np.zeros(len(r))
-    m = max_c == r; hue[m] = (60 * ((g[m] - b[m]) / delta[m])) % 360
-    m = max_c == g; hue[m] = (60 * ((b[m] - r[m]) / delta[m]) + 120)
-    m = max_c == b; hue[m] = (60 * ((r[m] - g[m]) / delta[m]) + 240)
-    hue_opencv = (hue / 2.0).astype(int) % 180   # 0-180
+    m = max_c == r; hue[m] = (60.0 * ((g[m] - b[m]) / delta[m])) % 360
+    m = max_c == g; hue[m] =  60.0 * ((b[m] - r[m]) / delta[m]) + 120
+    m = max_c == b; hue[m] =  60.0 * ((r[m] - g[m]) / delta[m]) + 240
+    hue_cv = (hue / 2.0).astype(int) % 180   # OpenCV 0-180 scale
 
-    # Histogram over hue (36 bins × 5° each)
-    hist, edges = np.histogram(hue_opencv, bins=36, range=(0, 180))
+    hist, edges = np.histogram(hue_cv, bins=36, range=(0, 180))
     peak_bin    = int(np.argmax(hist))
+    h_center    = (edges[peak_bin] + edges[peak_bin + 1]) / 2.0
 
-    # Cluster: all pixels within ±2 bins (~±10°) of the peak
-    h_center = (edges[peak_bin] + edges[peak_bin + 1]) / 2.0
-    in_cluster = np.abs(hue_opencv.astype(float) - h_center) <= 12
-    if np.sum(in_cluster) < min_count:
+    in_cluster = np.abs(hue_cv.astype(float) - h_center) <= 12
+    if int(np.sum(in_cluster)) < min_count:
         return None
 
-    cluster_rgb = colorful_pixels[in_cluster]
-    return tuple(np.median(cluster_rgb, axis=0).astype(int))
+    return tuple(np.median(colorful_pixels[in_cluster], axis=0).astype(int))
+
+
+def dominant_color_in_row(
+    img_rgb: np.ndarray,
+    row_y1: int, row_y2: int,
+    exclude_x1: int, exclude_x2: int,
+    min_count: int = 6,
+    min_density: float = 0.05,
+    max_search_px: int = 250,
+) -> Optional[Tuple]:
+    """
+    Find the ISO line colour sample adjacent to a legend text label.
+
+    WHY bounded search (not full-row):
+      In two-column legends the two entries on the same row each have their
+      own colour sample.  A full-row scan sees BOTH samples and picks the
+      dominant one, which is consistently the WRONG column's colour.
+      Bounding the search to ±max_search_px from the label edges keeps each
+      entry inside its own column's territory.
+
+    Strategy:
+      1. Search RIGHT:  [exclude_x2 + 5 … exclude_x2 + max_search_px]
+      2. Search LEFT:   [exclude_x1 - max_search_px … exclude_x1 - 5]
+      3. Collect colorful pixels from each side; compute density.
+      4. Pick the side with the HIGHER colorful-pixel density.
+      5. Return the median RGB of the dominant hue cluster on that side.
+    """
+    h_img, w_img = img_rgb.shape[:2]
+    row_y1 = max(0, row_y1)
+    row_y2 = min(h_img, row_y2)
+    if row_y2 <= row_y1:
+        return None
+
+    candidates = []   # list of (density, colorful_pixels_array, side_label)
+
+    # ── Right side ────────────────────────────────────────────────────────
+    rx1 = min(exclude_x2 + 5, w_img)
+    rx2 = min(exclude_x2 + max_search_px, w_img)
+    if rx2 > rx1:
+        cp = _colorful_pixels_in_region(img_rgb, row_y1, row_y2, rx1, rx2)
+        total = (row_y2 - row_y1) * (rx2 - rx1)
+        density = len(cp) / total if total > 0 else 0.0
+        if len(cp) >= min_count and density >= min_density:
+            candidates.append((density, cp, 'right'))
+
+    # ── Left side ─────────────────────────────────────────────────────────
+    lx1 = max(0, exclude_x1 - max_search_px)
+    lx2 = max(0, exclude_x1 - 5)
+    if lx2 > lx1:
+        cp = _colorful_pixels_in_region(img_rgb, row_y1, row_y2, lx1, lx2)
+        total = (row_y2 - row_y1) * (lx2 - lx1)
+        density = len(cp) / total if total > 0 else 0.0
+        if len(cp) >= min_count and density >= min_density:
+            candidates.append((density, cp, 'left'))
+
+    if not candidates:
+        return None
+
+    # Pick the side with the highest colorful-pixel density
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, best_pixels, best_side = candidates[0]
+    return _hue_cluster_median(best_pixels, min_count=min_count)
 
 
 def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=False):
@@ -864,13 +892,15 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
             exclude_x1=x1, exclude_x2=x2,
         )
 
-        # Fallback: if full-row approach failed, try a wider Y expansion
+        # Fallback: if normal search failed, try a wider Y expansion
+        # (handles colour samples placed slightly above/below the text baseline)
         if avg_color_tuple is None:
             avg_color_tuple = dominant_color_in_row(
                 img_rgb,
                 max(0, y1 - 15), min(h, y2 + 15),
                 exclude_x1=x1, exclude_x2=x2,
                 min_count=5, min_density=0.03,
+                max_search_px=250,
             )
 
         if avg_color_tuple is not None:
