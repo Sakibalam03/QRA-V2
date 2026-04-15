@@ -56,7 +56,7 @@ class TargetedPatchExtractor:
 
         # Complete ISO identifier pattern
         self.complete_pattern = re.compile(
-            r'(\d+(?:/\d+)?)\"\s*-\s*([A-Z0-9]{2})\s*-\s*(\d{4,6})(?:\s*-\s*([A-Z]\d{1,3}))?',
+            r'(\d+(?:/\d+)?)\"\s*-\s*([A-Z0-9]{2})\s*-\s*(\d{4,6})(?:\s*-\s*([A-Z]\d{2}))?',
             re.IGNORECASE
         )
 
@@ -122,7 +122,7 @@ class TargetedPatchExtractor:
 
         if suffix:
             suffix = suffix.upper().replace('O', '0').replace('I', '1')
-            if not (2 <= len(suffix) <= 4 and suffix[0].isalpha() and suffix[1:].isdigit()):
+            if not (len(suffix) == 3 and suffix[0].isalpha() and suffix[1:].isdigit()):
                 return None
             return f'{size}"-{code}-{number}-{suffix}'
 
@@ -1095,11 +1095,16 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
             if len(best_vivid_cp) >= 5 and (bx2 - bx1) > 100:
                 vsub_hsv       = cv2.cvtColor(full_crop, cv2.COLOR_RGB2HSV)
                 vivid_col_mask = (vsub_hsv[:, :, 1] > 70).any(axis=0)
-                if vivid_col_mask.any():
+                vivid_row_mask = (vsub_hsv[:, :, 1] > 70).any(axis=1)
+                if vivid_col_mask.any() and vivid_row_mask.any():
                     col_idxs   = np.where(vivid_col_mask)[0]
-                    narrow_lo  = max(0,           col_idxs[0]  - 20)
-                    narrow_hi  = min(bx2 - bx1,  col_idxs[-1] + 20)
-                    pattern_crop = full_crop[:, narrow_lo : narrow_hi + 1]
+                    row_idxs   = np.where(vivid_row_mask)[0]
+                    narrow_clo = max(0,                  col_idxs[0]  - 20)
+                    narrow_chi = min(bx2 - bx1,          col_idxs[-1] + 20)
+                    narrow_rlo = max(0,                  row_idxs[0]  - 5)
+                    narrow_rhi = min(full_crop.shape[0], row_idxs[-1] + 5)
+                    pattern_crop = full_crop[narrow_rlo:narrow_rhi + 1,
+                                             narrow_clo:narrow_chi + 1]
                 else:
                     pattern_crop = full_crop
             else:
@@ -1120,6 +1125,7 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
                 'hsv':     hsv_color,
                 'hex':     rgb_to_hex(avg_color_tuple),
                 'pattern': pattern,
+                'vivid':   len(best_vivid_cp),
             }
         else:
             print(f"  ⚠ Could not extract colour for {iso_name} "
@@ -1380,10 +1386,11 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
     def _find_iso_line_by_local_color(
         self,
-        bbox: tuple,
+        bbox:    tuple,
         img_rgb: np.ndarray,
-        img_h: int,
-        img_w: int,
+        img_h:   int,
+        img_w:   int,
+        polygon: Optional[list] = None,
     ) -> Optional[str]:
         """
         Associate an ISO identifier with a legend entry by sampling the
@@ -1433,20 +1440,78 @@ class ISOLineAssociator(TargetedPatchExtractor):
         #   to accept a match means far-away identifiers are correctly rejected.
         extracted_color: Optional[tuple] = None
         used_margin = 0
+        bw_bbox = x2 - x1
+        bh_bbox = y2 - y1
+        # Determine true text orientation.
+        # Prefer the polygon over the axis-aligned bbox: Surya OCR sometimes
+        # normalises a 90°-rotated text label to a landscape axis-aligned bbox
+        # even though the physical text region is tall and narrow.  The polygon
+        # corner-points always describe the actual image footprint of the text.
+        is_portrait = bh_bbox > bw_bbox * 2.0  # fallback: axis-aligned bbox
+        if polygon is not None and len(polygon) >= 4:
+            try:
+                pts = np.array(polygon, dtype=float)
+                # Average opposite edge pairs to get the true w/h of the text box
+                edge01 = float(np.linalg.norm(pts[1] - pts[0]))
+                edge12 = float(np.linalg.norm(pts[2] - pts[1]))
+                edge23 = float(np.linalg.norm(pts[3] - pts[2]))
+                edge30 = float(np.linalg.norm(pts[0] - pts[3]))
+                true_w = (edge01 + edge23) / 2.0
+                true_h = (edge12 + edge30) / 2.0
+                is_portrait = true_h > true_w * 2.0
+            except Exception:
+                pass  # keep axis-aligned estimate on any error
+        if is_portrait:
+            print(f"      [LOCAL] portrait bbox ({x1},{y1})-({x2},{y2})"
+                  f"  bw={bw_bbox}  bh={bh_bbox}"
+                  f"  poly={'yes' if polygon else 'no'}")
+        # Portrait bboxes use a stricter vivid-saturation threshold (90 vs 70).
+        # Reason: a vertical text label sitting beside a CPP-03 line (S=116) can
+        # pick up anti-aliased edge pixels (S≈82) at wider margins. S=82 is closer
+        # to CPP-01 (S=81) than CPP-03 (S=116), causing a wrong match.
+        # Raising the threshold to 90 excludes those edge pixels while keeping the
+        # core CPP-03 pixels (S=116) and other well-saturated lines.
+        s_thresh = 90 if is_portrait else 70
         for margin in [8, 15, 25, 40]:
-            rx1 = max(0, x1 - margin)
-            rx2 = min(img_w, x2 + margin)
-            ry1 = max(0, y1 - margin)
-            ry2 = min(img_h, y2 + margin)
+            if is_portrait:
+                # Vertical text beside a vertical line → expand only L/R.
+                # Horizontal lines above/below the text are NOT the target line.
+                rx1 = max(0, x1 - margin)
+                rx2 = min(img_w, x2 + margin)
+                ry1 = y1
+                ry2 = y2
+            else:
+                rx1 = max(0, x1 - margin)
+                rx2 = min(img_w, x2 + margin)
+                ry1 = max(0, y1 - margin)
+                ry2 = min(img_h, y2 + margin)
             cp = _colorful_pixels_in_region(img_rgb, ry1, ry2, rx1, rx2)
             if len(cp) < 8:
                 continue
             # Filter to vivid pixels only
             cp_arr  = cp.reshape(1, -1, 3).astype(np.uint8)
             cp_hsv  = cv2.cvtColor(cp_arr, cv2.COLOR_RGB2HSV).reshape(-1, 3)
-            vivid   = cp[cp_hsv[:, 1] > 70]
+            vivid   = cp[cp_hsv[:, 1] > s_thresh]
             if len(vivid) < 8:
                 continue   # not enough vivid pixels yet — keep expanding
+            # For portrait bboxes, verify that vivid pixels span vertically
+            # across at least 30% of the bbox height.  A vertical line running
+            # alongside the text will produce vivid pixels in most rows.  A
+            # horizontal line that merely clips through the window produces vivid
+            # pixels in only ~1–5 rows regardless of margin — reject that case
+            # so that identifiers near horizontal lines (e.g. 24"-NG-8831-D48
+            # near a horizontal CPP-08) are never falsely associated.
+            if is_portrait:
+                region      = img_rgb[ry1:ry2, rx1:rx2]
+                region_hsv  = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
+                row_has_vivid   = (region_hsv[:, :, 1] > s_thresh).any(axis=1)
+                vivid_row_span  = int(row_has_vivid.sum())
+                bbox_h          = y2 - y1
+                row_ratio       = vivid_row_span / max(1, bbox_h)
+                print(f"      [LOCAL] spread@margin={margin}: "
+                      f"vivid_rows={vivid_row_span}/{bbox_h} ({row_ratio:.2f})")
+                if row_ratio < 0.5:
+                    continue  # horizontal line clip only — not a vertical adjacency
             color = _hue_cluster_median(vivid, min_count=8)
             if color is not None:
                 extracted_color = color
@@ -1488,11 +1553,16 @@ class ISOLineAssociator(TargetedPatchExtractor):
             print(f"      [LOCAL] → no match (best dist {best_dist:.1f} > 45)")
             return None
 
-        # ── Step 3: pattern tiebreaker ────────────────────────────────────
+        # ── Step 3: pattern + vivid tiebreaker ───────────────────────────
         # When top-2 entries are within 8 distance units (same-color entries
         # that differ only in pattern, e.g. CPP-02 dashed vs CPP-08 solid),
         # detect the local line pattern from a horizontal strip around the
         # identifier and prefer the entry whose legend pattern matches.
+        # If pattern is ambiguous (multiple candidates share the same pattern
+        # or pattern detection returns 'unknown'), use the vivid pixel count
+        # from legend extraction as a secondary tiebreaker — more vivid pixels
+        # means the legend entry had a larger/denser color sample, which is a
+        # stronger signal for the "main" line vs a minor variant.
         if len(candidates) >= 2 and (candidates[1][1] - best_dist) < 8.0:
             cy_mid = (y1 + y2) // 2
             strip = img_rgb[
@@ -1502,16 +1572,42 @@ class ISOLineAssociator(TargetedPatchExtractor):
             local_pattern = (detect_line_pattern(strip)
                              if strip.size > 0 else 'unknown')
 
+            tied = [(name, dist) for name, dist in candidates
+                    if dist - best_dist < 8.0]
+
             if local_pattern != 'unknown':
-                for name, dist in candidates:
-                    if dist - best_dist < 8.0:
-                        if self.iso_color_map.get(name, {}).get(
-                                'pattern') == local_pattern:
-                            if name != best_name:
-                                print(f"      [LOCAL] pattern '{local_pattern}'"
-                                      f" → prefer {name} over {best_name}")
-                            best_name = name
-                            break
+                pattern_matches = [
+                    (name, dist) for name, dist in tied
+                    if self.iso_color_map.get(name, {}).get('pattern') == local_pattern
+                ]
+                if len(pattern_matches) == 1:
+                    # Unambiguous — exactly one candidate matches local pattern
+                    winner = pattern_matches[0][0]
+                    if winner != best_name:
+                        print(f"      [LOCAL] pattern '{local_pattern}'"
+                              f" → prefer {winner} over {best_name}")
+                    best_name = winner
+                elif len(pattern_matches) > 1:
+                    # Multiple candidates match same pattern → vivid tiebreaker
+                    winner = max(
+                        pattern_matches,
+                        key=lambda nc: self.iso_color_map.get(nc[0], {}).get('vivid', 0)
+                    )[0]
+                    if winner != best_name:
+                        print(f"      [LOCAL] pattern '{local_pattern}' tie"
+                              f" → vivid tiebreaker → prefer {winner} over {best_name}")
+                    best_name = winner
+                # else: no candidate matches local pattern → keep color-dist winner
+            else:
+                # Pattern unknown → vivid tiebreaker among all tied candidates
+                winner = max(
+                    tied,
+                    key=lambda nc: self.iso_color_map.get(nc[0], {}).get('vivid', 0)
+                )[0]
+                if winner != best_name:
+                    print(f"      [LOCAL] pattern unknown"
+                          f" → vivid tiebreaker → prefer {winner} over {best_name}")
+                best_name = winner
 
         return best_name
 
@@ -1519,41 +1615,82 @@ class ISOLineAssociator(TargetedPatchExtractor):
     # OCR with bbox tracking
     # ------------------------------------------------------------------
 
-    def run_ocr_with_bbox_map(
-        self, img: np.ndarray
-    ) -> Tuple[Dict[str, tuple], List[Tuple[str, tuple]]]:
+    def run_ocr_with_bbox_map(self, img: np.ndarray):
         """
         Run Surya OCR on a BGR patch image.
 
         Returns:
-            identifier_bbox_map : {complete_identifier_str: bbox}
-            texts_with_bboxes   : raw [(text, bbox), ...] from OCR
+            identifier_bbox_map    : {complete_identifier_str: bbox}
+            identifier_polygon_map : {complete_identifier_str: polygon | None}
+            texts_with_bboxes      : raw [(text, bbox), ...] from OCR
+            bbox_polygon_map       : {tuple(bbox): polygon | None}
         """
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         predictions = self.rec_predictor([img_pil], det_predictor=self.det_predictor)
         texts_with_bboxes = self.extract_text_from_predictions(predictions)
 
-        identifier_bbox_map: Dict[str, tuple] = {}
+        # Build bbox → polygon lookup from raw predictions.
+        # Surya provides a `polygon` attribute (list of 4 corner points) on each
+        # TextLine.  This reflects the TRUE text region orientation even when the
+        # axis-aligned bbox has been normalised to landscape for rotated text.
+        bbox_polygon_map: Dict[tuple, Optional[list]] = {}
+        for line in predictions[0].text_lines:
+            ltext = line.text.strip()
+            if ltext:
+                poly = getattr(line, 'polygon', None)
+                bbox_polygon_map[tuple(line.bbox)] = poly
+
+        identifier_bbox_map:     Dict[str, tuple]          = {}
+        identifier_polygon_map:  Dict[str, Optional[list]] = {}
         for text, bbox in texts_with_bboxes:
-            # Skip portrait-oriented text boxes (height > 2× width).
-            # In P&ID patches, identifiers written vertically (rotated 90°) are
-            # labels for pipe connectors / junction elements, not for the main
-            # coloured pipeline runs.  Their bboxes are portrait (tall narrow).
-            # Horizontal identifier labels have bbox width >> height.
-            bw = bbox[2] - bbox[0]
-            bh = bbox[3] - bbox[1]
-            if bh > bw * 2.0:
-                continue
             match = self.complete_pattern.search(text)
             if match:
                 formatted = self.normalize_identifier(
                     match.group(1), match.group(2), match.group(3), match.group(4)
                 )
                 if formatted and formatted not in identifier_bbox_map:
-                    identifier_bbox_map[formatted] = bbox
+                    identifier_bbox_map[formatted]    = bbox
+                    identifier_polygon_map[formatted] = bbox_polygon_map.get(tuple(bbox))
 
-        return identifier_bbox_map, texts_with_bboxes
+        # ── Pairwise merging: recover identifiers split across adjacent OCR boxes
+        # Surya OCR sometimes splits a single identifier into two adjacent text
+        # boxes (e.g. "6"-OW-8601-D" + "03").  Sort boxes left-to-right and try
+        # joining each nearby pair that shares the same text row.
+        # Only merge boxes that are NOT already complete identifiers on their own
+        # (prevents "6"-OW-8601-D03" + "0" → spurious "6"-OW-8601-D030").
+        sorted_twb = sorted(texts_with_bboxes, key=lambda t: t[1][0])
+        for i, (ti, bi) in enumerate(sorted_twb):
+            # Skip if ti is itself a complete identifier — no need to extend it
+            if self.complete_pattern.search(ti):
+                continue
+            for j in range(i + 1, min(i + 6, len(sorted_twb))):
+                tj, bj = sorted_twb[j]
+                # Must share the same row: vertical overlap ≥ 30% of taller box
+                v_overlap = min(bi[3], bj[3]) - max(bi[1], bj[1])
+                row_h     = max(bi[3] - bi[1], bj[3] - bj[1])
+                if row_h == 0 or v_overlap < row_h * 0.3:
+                    continue
+                # Must be horizontally close (gap ≤ 50px, left box first)
+                h_gap = bj[0] - bi[2]
+                if h_gap < -10 or h_gap > 50:
+                    continue
+                combined_text = ti + tj
+                m = self.complete_pattern.search(combined_text)
+                if m:
+                    formatted = self.normalize_identifier(
+                        m.group(1), m.group(2), m.group(3), m.group(4)
+                    )
+                    if formatted and formatted not in identifier_bbox_map:
+                        merged_bbox = (
+                            min(bi[0], bj[0]), min(bi[1], bj[1]),
+                            max(bi[2], bj[2]), max(bi[3], bj[3]),
+                        )
+                        identifier_bbox_map[formatted]    = merged_bbox
+                        identifier_polygon_map[formatted] = None  # no single polygon
+
+        return (identifier_bbox_map, identifier_polygon_map,
+                texts_with_bboxes, bbox_polygon_map)
 
     # ------------------------------------------------------------------
     # Extension handling with association
@@ -1604,16 +1741,35 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 continue
 
             try:
-                complete_ids, _ = self.run_ocr_on_image(extended_region)
+                complete_ids, ext_texts = self.run_ocr_on_image(extended_region)
             except Exception as e:
                 print(f"    ✗ OCR error on extension: {e}")
                 continue
+
+            # Fallback: when extension OCR doesn't produce a complete identifier
+            # by itself, try combining the original partial text with each text
+            # line returned by the extension OCR.  This handles the common case
+            # where the combined region is split across two boxes
+            # (e.g. partial "3"-NG" in current patch + "-8980-D48" in extension
+            # both appear as separate OCR lines instead of one merged string).
+            if not complete_ids:
+                for ext_text, _ in ext_texts:
+                    for combined in (text + ext_text, ext_text + text):
+                        m = self.complete_pattern.search(combined)
+                        if m:
+                            f = self.normalize_identifier(
+                                m.group(1), m.group(2), m.group(3), m.group(4)
+                            )
+                            if f:
+                                complete_ids.add(f)
+                                break
 
             for identifier in complete_ids:
                 # Associate using local color at the partial's original bbox
                 # in the current patch (the line is here, not in the extension)
                 iso_line = self._find_iso_line_by_local_color(
-                    bbox, img_rgb, img_h, img_w
+                    bbox, img_rgb, img_h, img_w,
+                    polygon=partial.get('polygon'),
                 )
                 if iso_line:
                     color_info = self.iso_color_map[iso_line]
@@ -1659,15 +1815,17 @@ class ISOLineAssociator(TargetedPatchExtractor):
         print(f"\n  [PROCESS] {patch_path.name}")
 
         # ── Step 2: OCR ──────────────────────────────────────────────────
-        identifier_bbox_map, texts_with_bboxes = self.run_ocr_with_bbox_map(patch)
+        (identifier_bbox_map, identifier_polygon_map,
+         texts_with_bboxes, bbox_polygon_map) = self.run_ocr_with_bbox_map(patch)
 
         associations: List[Tuple[str, str, dict]] = []
         seen_ids: Set[str] = set()
 
         # ── Step 3: associate complete identifiers ────────────────────────
         for identifier, bbox in identifier_bbox_map.items():
+            polygon = identifier_polygon_map.get(identifier)
             iso_line = self._find_iso_line_by_local_color(
-                bbox, img_rgb, img_h, img_w
+                bbox, img_rgb, img_h, img_w, polygon=polygon
             )
             if iso_line:
                 color_info = self.iso_color_map[iso_line]
@@ -1685,11 +1843,6 @@ class ISOLineAssociator(TargetedPatchExtractor):
         for text, bbox in texts_with_bboxes:
             if any(text in cid for cid in seen_ids):
                 continue
-            # Skip portrait-oriented text (same filter as run_ocr_with_bbox_map)
-            bw = bbox[2] - bbox[0]
-            bh = bbox[3] - bbox[1]
-            if bh > bw * 2.0:
-                continue
             if self.has_partial_pattern(text):
                 edge, direction = self.determine_edge_and_direction(
                     bbox, img_w, img_h
@@ -1700,6 +1853,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
                         'bbox':      bbox,
                         'edge':      edge,
                         'direction': direction,
+                        'polygon':   bbox_polygon_map.get(tuple(bbox)),
                     })
 
         if partials_info:
