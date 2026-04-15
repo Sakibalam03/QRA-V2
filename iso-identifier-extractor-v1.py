@@ -1018,6 +1018,56 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
                 best_vivid_cp = cp[vivid_mask]
                 best_region   = (sx1, sx2)
 
+        # ── Fallback pass: y-expanded search when strict bounds yield vivid=0 ──
+        # Cause: OCR sometimes returns a bbox for a continuation/wrap line that
+        # is BELOW the row containing the colour sample.  (CPP-09 example: the
+        # description "Condensate from 1st Stage Separator to FSO2 export
+        # pipeline" wraps across 2 table rows; the colour sample is in the top
+        # row but the OCR detection y-range can fall on the lower continuation.)
+        # Fix: when vivid=0 for ALL strict-bound regions, search the right-side
+        # column (Node Legend) with gradually expanded y-bounds (upward first,
+        # then ±N rows) until vivid pixels are found.
+        if best_score < 5 * 100_000:   # vivid_count = 0 in every strict region
+            row_h = max(y2 - y1, 20)
+            right_side = [(int(w * 0.50), w - 10), (int(w * 0.60), w - 10)]
+            for expand_rows in [1, 2, 3]:
+                improved = False
+                # Try above first (most common mismatch direction), then ±
+                for exp_y1, exp_y2 in [
+                    (max(0, y1 - expand_rows * row_h),  y2),          # extend up
+                    (y1, min(h, y2 + expand_rows * row_h)),            # extend down
+                    (max(0, y1 - expand_rows * row_h),
+                     min(h, y2 + expand_rows * row_h)),                # both
+                ]:
+                    if exp_y2 <= exp_y1:
+                        continue
+                    for sx1_r, sx2_r in right_side:
+                        sx1_r = max(0, sx1_r)
+                        sx2_r = min(w, sx2_r)
+                        if sx1_r >= sx2_r:
+                            continue
+                        cp_exp = _colorful_pixels_in_region(
+                            img_rgb, exp_y1, exp_y2, sx1_r, sx2_r)
+                        if len(cp_exp) == 0:
+                            continue
+                        cp_arr_exp  = cp_exp.reshape(1, -1, 3).astype(np.uint8)
+                        cp_hsv_exp  = cv2.cvtColor(
+                            cp_arr_exp, cv2.COLOR_RGB2HSV).reshape(-1, 3)
+                        vivid_exp   = cp_hsv_exp[:, 1] > 70
+                        vivid_cnt_e = int(np.sum(vivid_exp))
+                        score_exp   = vivid_cnt_e * 100_000 + len(cp_exp)
+                        if score_exp > best_score:
+                            best_score    = score_exp
+                            best_cp       = cp_exp
+                            best_vivid_cp = cp_exp[vivid_exp]
+                            best_region   = (sx1_r, sx2_r)
+                            improved = True
+                            print(f"    [LEGEND] {iso_name} y-expand ±{expand_rows}row "
+                                  f"y({exp_y1}-{exp_y2}) x({sx1_r}-{sx2_r}) "
+                                  f"vivid={vivid_cnt_e} px={len(cp_exp)}")
+                if improved and best_score >= 5 * 100_000:
+                    break   # found vivid pixels — stop expanding
+
         # Pass vivid pixels to hue clustering; fall back to all colorful if
         # the entry uses a genuinely pale colour (e.g. very light lavenders).
         pixels_for_color = best_vivid_cp if len(best_vivid_cp) >= 5 else best_cp
@@ -1032,9 +1082,29 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
             hsv_color      = rgb_to_hsv(avg_color_tuple)
             iso_normalized = re.sub(r'\s+', ' ', iso_name.upper())
 
-            # Colour-region crop for pattern detection and optional saving
-            best_color_region = img_rgb[y1:y2, bx1:bx2, :]
-            pattern = detect_line_pattern(best_color_region, iso_name)
+            # ── Pattern detection on VIVID-pixel-narrowed crop ───────────────
+            # Problem: the best_region can be 1900+ px wide (e.g. x1920-3830).
+            # When detect_line_pattern samples rows across this full width, the
+            # dashed-line segment (a few hundred pixels in one cell) is flanked
+            # by 1000+ px of white space on each side.  Sample rows that land
+            # outside the dash segment see only white → recorded as coverage=0
+            # and are discarded, leaving too few samples to call 'dashed'.
+            # Fix: narrow the crop to the x-range that actually contains vivid
+            # (highly saturated) pixels — that's where the colour sample lives.
+            full_crop = img_rgb[y1:y2, bx1:bx2]
+            if len(best_vivid_cp) >= 5 and (bx2 - bx1) > 100:
+                vsub_hsv       = cv2.cvtColor(full_crop, cv2.COLOR_RGB2HSV)
+                vivid_col_mask = (vsub_hsv[:, :, 1] > 70).any(axis=0)
+                if vivid_col_mask.any():
+                    col_idxs   = np.where(vivid_col_mask)[0]
+                    narrow_lo  = max(0,           col_idxs[0]  - 20)
+                    narrow_hi  = min(bx2 - bx1,  col_idxs[-1] + 20)
+                    pattern_crop = full_crop[:, narrow_lo : narrow_hi + 1]
+                else:
+                    pattern_crop = full_crop
+            else:
+                pattern_crop = full_crop
+            pattern = detect_line_pattern(pattern_crop, iso_name)
 
             if save_color_regions:
                 os.makedirs('color_regions', exist_ok=True)
@@ -1043,7 +1113,7 @@ def detect_iso_texts_and_colors(image_path, debug=False, save_color_regions=Fals
                     f'{iso_normalized.replace("/", "_").replace(" ", "_")}.png'
                 )
                 cv2.imwrite(region_path,
-                            cv2.cvtColor(best_color_region, cv2.COLOR_RGB2BGR))
+                            cv2.cvtColor(full_crop, cv2.COLOR_RGB2BGR))
 
             iso_color_map[iso_normalized] = {
                 'rgb':     avg_color_tuple,
