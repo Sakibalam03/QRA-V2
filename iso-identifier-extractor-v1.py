@@ -1414,10 +1414,23 @@ class ISOLineAssociator(TargetedPatchExtractor):
         if x2 <= x1 or y2 <= y1:
             return None
 
-        # ── Step 1: sample colorful pixels in an expanding window ────────
-        # Start tight so we only pick up the adjacent line; expand only when
-        # too few colorful pixels are found (handles the case where the line
-        # runs slightly above/below the text bbox).
+        # ── Step 1: sample VIVID pixels in an expanding window ───────────
+        # Only vivid pixels (HSV S > 70) are used for colour extraction.
+        #
+        # WHY vivid-only (not all colorful):
+        #   The window around an identifier picks up BOTH line pixels AND pale
+        #   white/grey background pixels.  Using all colorful pixels biases the
+        #   hue-cluster median toward the pale background, lowering the apparent
+        #   saturation.  For entries that differ primarily in saturation
+        #   (e.g. CPP-01 S=81 vs CPP-03 S=116), a diluted S=82 median would
+        #   incorrectly match CPP-01 even when a vivid CPP-03 line is adjacent.
+        #   Using only vivid pixels isolates the actual line colour.
+        #
+        # WHY this also rejects false positives (e.g. 18"-NG-8113-D48):
+        #   Identifiers that are NOT adjacent to any coloured line produce only
+        #   pale background colorful pixels at every margin.  These have S < 70
+        #   and therefore contribute no vivid pixels.  Requiring ≥ 8 vivid pixels
+        #   to accept a match means far-away identifiers are correctly rejected.
         extracted_color: Optional[tuple] = None
         used_margin = 0
         for margin in [8, 15, 25, 40]:
@@ -1426,15 +1439,22 @@ class ISOLineAssociator(TargetedPatchExtractor):
             ry1 = max(0, y1 - margin)
             ry2 = min(img_h, y2 + margin)
             cp = _colorful_pixels_in_region(img_rgb, ry1, ry2, rx1, rx2)
-            if len(cp) >= 8:
-                color = _hue_cluster_median(cp, min_count=8)
-                if color is not None:
-                    extracted_color = color
-                    used_margin     = margin
-                    break
+            if len(cp) < 8:
+                continue
+            # Filter to vivid pixels only
+            cp_arr  = cp.reshape(1, -1, 3).astype(np.uint8)
+            cp_hsv  = cv2.cvtColor(cp_arr, cv2.COLOR_RGB2HSV).reshape(-1, 3)
+            vivid   = cp[cp_hsv[:, 1] > 70]
+            if len(vivid) < 8:
+                continue   # not enough vivid pixels yet — keep expanding
+            color = _hue_cluster_median(vivid, min_count=8)
+            if color is not None:
+                extracted_color = color
+                used_margin     = margin
+                break
 
         if extracted_color is None:
-            print(f"      [LOCAL] no colorful pixels near "
+            print(f"      [LOCAL] no vivid pixels near "
                   f"bbox ({x1},{y1})-({x2},{y2})")
             return None
 
@@ -1516,6 +1536,15 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         identifier_bbox_map: Dict[str, tuple] = {}
         for text, bbox in texts_with_bboxes:
+            # Skip portrait-oriented text boxes (height > 2× width).
+            # In P&ID patches, identifiers written vertically (rotated 90°) are
+            # labels for pipe connectors / junction elements, not for the main
+            # coloured pipeline runs.  Their bboxes are portrait (tall narrow).
+            # Horizontal identifier labels have bbox width >> height.
+            bw = bbox[2] - bbox[0]
+            bh = bbox[3] - bbox[1]
+            if bh > bw * 2.0:
+                continue
             match = self.complete_pattern.search(text)
             if match:
                 formatted = self.normalize_identifier(
@@ -1655,6 +1684,11 @@ class ISOLineAssociator(TargetedPatchExtractor):
         partials_info: List[dict] = []
         for text, bbox in texts_with_bboxes:
             if any(text in cid for cid in seen_ids):
+                continue
+            # Skip portrait-oriented text (same filter as run_ocr_with_bbox_map)
+            bw = bbox[2] - bbox[0]
+            bh = bbox[3] - bbox[1]
+            if bh > bw * 2.0:
                 continue
             if self.has_partial_pattern(text):
                 edge, direction = self.determine_edge_and_direction(
