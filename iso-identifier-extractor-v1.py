@@ -60,6 +60,14 @@ class TargetedPatchExtractor:
             re.IGNORECASE
         )
 
+        # Strips a single spurious OCR character inserted between SIZE"- and the
+        # 2-char code, e.g. "24"-JNG-8831-D48" → "24"-NG-8831-D48"
+        # Only fires when exactly one extra char precedes a valid 2-letter code.
+        self._spurious_infix_re = re.compile(
+            r'(\d+(?:/\d+)?\")\s*-\s*[A-Z0-9]([A-Z]{2}\s*-\s*\d)',
+            re.IGNORECASE
+        )
+
         # STRICT partial patterns - MUST have dashes and match ISO structure
         # ISO format: SIZE"-CODE-NUMBER-SUFFIX
         # SIZE: digits with optional /fraction
@@ -102,6 +110,13 @@ class TargetedPatchExtractor:
             re.compile(r'^-\s*(\d{4,6})$', re.I),
         ]
 
+    def _clean_identifier_text(self, text: str) -> str:
+        """Remove a single spurious OCR character between SIZE\"- and the 2-char code.
+        E.g. '24\"-JNG-8831-D48' → '24\"-NG-8831-D48'
+             '24\"-1VG-8131-D48' → '24\"-VG-8131-D48'
+        """
+        return self._spurious_infix_re.sub(r'\1-\2', text)
+
     def normalize_identifier(self, size, code, number, suffix=None):
         """Normalize and fix OCR errors"""
         code = code.upper()
@@ -112,6 +127,7 @@ class TargetedPatchExtractor:
         elif code == 'C0': code = 'CO'
         elif code == 'CQ': code = 'CG'
         elif code == 'NC': code = 'NG'
+        elif code == 'VG': code = 'NG'
 
         if not (len(code) == 2 and code.isalpha()):
             return None
@@ -1840,7 +1856,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
         identifier_bbox_map:     Dict[str, tuple]          = {}
         identifier_polygon_map:  Dict[str, Optional[list]] = {}
         for text, bbox in texts_with_bboxes:
-            match = self.complete_pattern.search(text)
+            match = self.complete_pattern.search(self._clean_identifier_text(text))
             if match:
                 formatted = self.normalize_identifier(
                     match.group(1), match.group(2), match.group(3), match.group(4)
@@ -1872,7 +1888,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 if h_gap < -10 or h_gap > 50:
                     continue
                 combined_text = ti + tj
-                m = self.complete_pattern.search(combined_text)
+                m = self.complete_pattern.search(self._clean_identifier_text(combined_text))
                 if m:
                     formatted = self.normalize_identifier(
                         m.group(1), m.group(2), m.group(3), m.group(4)
@@ -1884,6 +1900,41 @@ class ISOLineAssociator(TargetedPatchExtractor):
                         )
                         identifier_bbox_map[formatted]    = merged_bbox
                         identifier_polygon_map[formatted] = None  # no single polygon
+
+        # ── Vertical pairwise merging: recover portrait identifiers split into
+        # two stacked OCR boxes (common when text is rotated/vertical).
+        # Collect boxes taller than wide (portrait-ish) that aren't yet complete.
+        portrait_twb = [
+            (t, b) for t, b in texts_with_bboxes
+            if (b[3] - b[1]) > (b[2] - b[0]) * 1.5
+            and not self.complete_pattern.search(t)
+        ]
+        portrait_twb.sort(key=lambda tb: ((tb[1][0] + tb[1][2]) / 2, tb[1][1]))
+        for i, (ti, bi) in enumerate(portrait_twb):
+            xi_ctr = (bi[0] + bi[2]) / 2
+            for j in range(i + 1, min(i + 4, len(portrait_twb))):
+                tj, bj = portrait_twb[j]
+                # Must be in the same x-column (within 30px)
+                if abs((bj[0] + bj[2]) / 2 - xi_ctr) > 30:
+                    continue
+                # Must be vertically close (gap ≤ 60px, no overlap)
+                v_gap = bj[1] - bi[3]
+                if v_gap < -10 or v_gap > 60:
+                    continue
+                for combined in (ti + tj, tj + ti):
+                    m = self.complete_pattern.search(self._clean_identifier_text(combined))
+                    if m:
+                        formatted = self.normalize_identifier(
+                            m.group(1), m.group(2), m.group(3), m.group(4)
+                        )
+                        if formatted and formatted not in identifier_bbox_map:
+                            merged_bbox = (
+                                min(bi[0], bj[0]), min(bi[1], bj[1]),
+                                max(bi[2], bj[2]), max(bi[3], bj[3]),
+                            )
+                            identifier_bbox_map[formatted]    = merged_bbox
+                            identifier_polygon_map[formatted] = None
+                        break
 
         return (identifier_bbox_map, identifier_polygon_map,
                 texts_with_bboxes, bbox_polygon_map)
@@ -1949,9 +2000,10 @@ class ISOLineAssociator(TargetedPatchExtractor):
             # (e.g. partial "3"-NG" in current patch + "-8980-D48" in extension
             # both appear as separate OCR lines instead of one merged string).
             if not complete_ids:
+                # Try partial text combined with each ext_text
                 for ext_text, _ in ext_texts:
                     for combined in (text + ext_text, ext_text + text):
-                        m = self.complete_pattern.search(combined)
+                        m = self.complete_pattern.search(self._clean_identifier_text(combined))
                         if m:
                             f = self.normalize_identifier(
                                 m.group(1), m.group(2), m.group(3), m.group(4)
@@ -1959,6 +2011,22 @@ class ISOLineAssociator(TargetedPatchExtractor):
                             if f:
                                 complete_ids.add(f)
                                 break
+
+            if not complete_ids and len(ext_texts) >= 2:
+                # Try all pairs of ext_texts against each other — handles the case
+                # where the extension OCR splits the identifier across two boxes
+                # (e.g. '24"-NG-8131' + '-D48' → '24"-NG-8131-D48')
+                for i, (et_i, _) in enumerate(ext_texts):
+                    for et_j, _ in ext_texts[i + 1:]:
+                        for combined in (et_i + et_j, et_j + et_i):
+                            m = self.complete_pattern.search(self._clean_identifier_text(combined))
+                            if m:
+                                f = self.normalize_identifier(
+                                    m.group(1), m.group(2), m.group(3), m.group(4)
+                                )
+                                if f:
+                                    complete_ids.add(f)
+                                    break
 
             for identifier in complete_ids:
                 # Associate using local color at the partial's original bbox
@@ -2116,7 +2184,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 # ============================================================
 
 def main_with_legend():
-    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-3"
+    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-2"
     legend_path  = input("Enter path to ISO legend image: ").strip().strip("'\"")
     page_name    = input("Enter page name (e.g. ERCP_2): ").strip() or "ERCP_2"
 
