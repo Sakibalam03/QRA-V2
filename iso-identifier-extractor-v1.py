@@ -1472,7 +1472,8 @@ class ISOLineAssociator(TargetedPatchExtractor):
         # Raising the threshold to 90 excludes those edge pixels while keeping the
         # core CPP-03 pixels (S=116) and other well-saturated lines.
         s_thresh = 90 if is_portrait else 70
-        for margin in [8, 15, 25, 40]:
+
+        for margin in [8, 15, 25]:   # Phase 1: tight proximity search
             if is_portrait:
                 # Vertical text beside a vertical line → expand only L/R.
                 # Horizontal lines above/below the text are NOT the target line.
@@ -1519,9 +1520,25 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 break
 
         if extracted_color is None:
-            print(f"      [LOCAL] no vivid pixels near "
-                  f"bbox ({x1},{y1})-({x2},{y2})")
-            return None
+            # ── Phase 2: leader-arrow detection ──────────────────────────
+            # Phase 1 found no coloured pixels within 25 px.  Try to detect a
+            # leader arrow departing from the text bbox and sample the coloured
+            # ISO line at its tip (up to 50 px away).
+            # For portrait bboxes raise the minimum vivid-pixel count in the
+            # arrow direction to 50 (vs 8 for landscape).  A false-positive
+            # portrait arrow (e.g. 24"-NG-8114-D48) produces only ~28 incidental
+            # vivid pixels, while a real ISO line connected by a leader arrow
+            # produces hundreds.  This threshold separates the two reliably.
+            arrow_color, arrow_detected = self._detect_and_follow_arrow(
+                img_rgb, x1, y1, x2, y2, img_h, img_w,
+                min_vivid_directed=(50 if is_portrait else 8),
+            )
+            if not arrow_detected:
+                return None   # no arrow found and Phase 1 also failed
+            if arrow_color is None:
+                return None   # arrow found but tip is uncoloured → exclude
+            extracted_color = arrow_color
+            used_margin = 50  # indicative: colour found via leader arrow
 
         ex_h, ex_s, ex_v = rgb_to_hsv(extracted_color)
 
@@ -1563,19 +1580,46 @@ class ISOLineAssociator(TargetedPatchExtractor):
         # from legend extraction as a secondary tiebreaker — more vivid pixels
         # means the legend entry had a larger/denser color sample, which is a
         # stronger signal for the "main" line vs a minor variant.
-        if len(candidates) >= 2 and (candidates[1][1] - best_dist) < 8.0:
+        if len(candidates) >= 2 and (candidates[1][1] - best_dist) < 25.0:
             cy_mid = (y1 + y2) // 2
+            # Use a 40 px tall strip (±20 px) so the sample spans multiple
+            # dash/gap cycles of dashed lines.  A 16 px strip (±8 px) can land
+            # entirely on a solid segment between dashes and wrongly return
+            # 'solid', causing the correct dashed legend entry to be bypassed.
             strip = img_rgb[
-                max(0, cy_mid - 8) : min(img_h, cy_mid + 8),
-                max(0, x1 - 60)   : min(img_w, x2 + 60),
+                max(0, cy_mid - 20) : min(img_h, cy_mid + 20),
+                max(0, x1 - 80)    : min(img_w, x2 + 80),
             ]
             local_pattern = (detect_line_pattern(strip)
                              if strip.size > 0 else 'unknown')
+            print(f"      [LOCAL] pattern_strip local='{local_pattern}'  "
+                  + "  ".join(
+                      f"{n}={self.iso_color_map.get(n,{}).get('pattern','?')}"
+                      for n, _ in candidates[:5]
+                  ))
 
             tied = [(name, dist) for name, dist in candidates
-                    if dist - best_dist < 8.0]
+                    if dist - best_dist < 25.0]
 
-            if local_pattern != 'unknown':
+            # When all tied candidates share the exact same HSV distance (spread
+            # < 0.5 units), their colours are literally identical in the legend.
+            # Pattern detection on the local strip is unreliable here because any
+            # dashed pattern reading will arbitrarily prefer dashed-legend entries
+            # even when the correct entry (CPP-08 solid, larger legend sample) is
+            # present.  Use vivid count directly — a larger legend sample is a
+            # stronger signal for the dominant line variant.
+            tied_dists = [d for _, d in tied]
+            dist_spread = (max(tied_dists) - min(tied_dists)) if tied_dists else 0.0
+            if dist_spread < 0.5:
+                winner = max(
+                    tied,
+                    key=lambda nc: self.iso_color_map.get(nc[0], {}).get('vivid', 0)
+                )[0]
+                if winner != best_name:
+                    print(f"      [LOCAL] identical-color spread={dist_spread:.2f}"
+                          f" → vivid tiebreaker → prefer {winner} over {best_name}")
+                best_name = winner
+            elif local_pattern != 'unknown':
                 pattern_matches = [
                     (name, dist) for name, dist in tied
                     if self.iso_color_map.get(name, {}).get('pattern') == local_pattern
@@ -1610,6 +1654,158 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 best_name = winner
 
         return best_name
+
+    # ------------------------------------------------------------------
+    # Leader-arrow detection  (Phase 2 of local-colour association)
+    # ------------------------------------------------------------------
+
+    def _detect_and_follow_arrow(
+        self,
+        img_rgb: np.ndarray,
+        x1: int, y1: int, x2: int, y2: int,
+        img_h:  int,
+        img_w:  int,
+        min_vivid_directed: int = 8,
+    ) -> Tuple[Optional[tuple], bool]:
+        """
+        Detect a leader arrow departing from the identifier text bbox and
+        return the median RGB of the coloured ISO line at its tip.
+
+        Context
+        -------
+        Some P&ID identifiers are displaced from their ISO line and connected
+        to it by a thin dark arrow (straight or L-shaped) that always points
+        FROM the text TOWARD the line.  The arrowhead (small triangle) touches
+        the coloured line.  Arrow length is typically 20–50 px; it can depart
+        from any point on the text boundary.
+
+        Algorithm
+        ---------
+        A. Scan an annular ring 5–18 px outside the text bbox for near-black
+           pixels (V < 80, S < 60).  Their centroid relative to the bbox centre
+           gives an estimate of the arrow departure direction.
+        B. Expand to 50 px and keep only vivid (S > 70) pixels whose direction
+           from the bbox centre is within ±60° (cos ≥ 0.5) of that arrow
+           direction AND are more than 25 px from the bbox boundary (pixels
+           inside Phase-1 range were already handled).
+        C. If ≥ min_vivid_directed such vivid pixels exist, return their
+           hue-cluster median RGB so the caller can match against the legend.
+           If no vivid pixels lie in the arrow direction, the arrow points to an
+           uncoloured line — return None so the identifier is excluded.
+
+        Returns
+        -------
+        (color, True)  — arrow detected, tip is coloured; color is the RGB tuple
+        (None,  True)  — arrow detected, tip is uncoloured → caller should reject
+        (None,  False) — no arrow detected → caller should fall through to Phase 1
+        """
+        RING_INNER = 5     # px outside bbox where ring starts (skip anti-alias bleed)
+        RING_OUTER = 18    # px outside bbox where ring ends
+        ARROW_MAX  = 50    # px: maximum arrow length to search
+        MIN_DARK   = 5     # minimum near-black pixels required to declare an arrow
+        COS_THRESH = 0.50  # cos(60°) — vivid pixel must be within 60° of arrow dir
+
+        # ── A: find near-black pixels in the ring ────────────────────────
+        ry1 = max(0, y1 - RING_OUTER)
+        ry2 = min(img_h, y2 + RING_OUTER)
+        rx1 = max(0, x1 - RING_OUTER)
+        rx2 = min(img_w, x2 + RING_OUTER)
+
+        ring = img_rgb[ry1:ry2, rx1:rx2]
+        if ring.size == 0:
+            return None
+
+        ring_hsv = cv2.cvtColor(ring, cv2.COLOR_RGB2HSV)
+        # Near-black: dark value AND low saturation (avoids dark-coloured lines)
+        near_black = (ring_hsv[:, :, 2] < 80) & (ring_hsv[:, :, 1] < 60)
+
+        # Exclude the inner zone (bbox + RING_INNER border) to skip text pixels
+        # and immediate anti-aliasing bleed
+        ey1 = max(0,            y1 - RING_INNER - ry1)
+        ey2 = min(ring.shape[0], y2 + RING_INNER - ry1)
+        ex1 = max(0,            x1 - RING_INNER - rx1)
+        ex2 = min(ring.shape[1], x2 + RING_INNER - rx1)
+        near_black[ey1:ey2, ex1:ex2] = False
+
+        dark_coords = np.argwhere(near_black)   # (row, col) in ring coords
+        if len(dark_coords) < MIN_DARK:
+            return None, False   # no arrow detected
+
+        # ── B: arrow direction from dark-pixel centroid ──────────────────
+        bbox_cy_r = (y1 + y2) / 2.0 - ry1   # bbox centre in ring coords
+        bbox_cx_c = (x1 + x2) / 2.0 - rx1
+
+        dir_r = float(dark_coords[:, 0].mean()) - bbox_cy_r
+        dir_c = float(dark_coords[:, 1].mean()) - bbox_cx_c
+
+        mag = (dir_r ** 2 + dir_c ** 2) ** 0.5
+        if mag < 2.0:
+            return None, False   # no clear directional bias
+
+        arrow_dy = dir_r / mag   # row component (↓ positive)
+        arrow_dx = dir_c / mag   # col component (→ positive)
+        print(f"      [ARROW] detected dir=({arrow_dx:+.2f},{arrow_dy:+.2f})"
+              f"  dark_px={len(dark_coords)}")
+
+        # ── C: vivid pixels within ARROW_MAX in the arrow direction ──────
+        ay1 = max(0, y1 - ARROW_MAX)
+        ay2 = min(img_h, y2 + ARROW_MAX)
+        ax1 = max(0, x1 - ARROW_MAX)
+        ax2 = min(img_w, x2 + ARROW_MAX)
+
+        arrow_region = img_rgb[ay1:ay2, ax1:ax2]
+        if arrow_region.size == 0:
+            return None, True   # arrow detected but region empty → treat as uncoloured
+
+        ar_hsv    = cv2.cvtColor(arrow_region, cv2.COLOR_RGB2HSV)
+        vivid_mask = ar_hsv[:, :, 1] > 70
+        vivid_coords = np.argwhere(vivid_mask)   # (row, col) in arrow-region coords
+
+        if len(vivid_coords) < 8:
+            print(f"      [ARROW] no vivid pixels within {ARROW_MAX}px → reject")
+            return None, True   # arrow detected, tip is uncoloured
+
+        # Absolute coordinates of each vivid pixel
+        pix_r = vivid_coords[:, 0].astype(float) + ay1
+        pix_c = vivid_coords[:, 1].astype(float) + ax1
+
+        # Direction vector from bbox centre to each vivid pixel
+        bcr = (y1 + y2) / 2.0
+        bcc = (x1 + x2) / 2.0
+        vec_r = pix_r - bcr
+        vec_c = pix_c - bcc
+        pix_dist = np.sqrt(vec_r ** 2 + vec_c ** 2)
+
+        # Distance from the nearest point on the bbox BOUNDARY (not centre).
+        # Pixels inside Phase-1 range (≤ 25 px from boundary) are skipped.
+        nearest_r = np.clip(pix_r, y1, y2)
+        nearest_c = np.clip(pix_c, x1, x2)
+        dist_from_bbox = np.sqrt((pix_r - nearest_r) ** 2 + (pix_c - nearest_c) ** 2)
+        beyond_phase1 = dist_from_bbox > 25
+
+        # Cosine of angle between arrow direction and each pixel's direction
+        cos_angle = (vec_r * arrow_dy + vec_c * arrow_dx) / np.maximum(pix_dist, 1.0)
+
+        in_arrow_dir = beyond_phase1 & (cos_angle >= COS_THRESH)
+
+        if not in_arrow_dir.any():
+            print(f"      [ARROW] vivid pixels present but none in arrow direction"
+                  f" → arrow points to uncoloured line → reject")
+            return None, True   # arrow detected, tip is uncoloured
+
+        directed_pixels = arrow_region[
+            vivid_coords[in_arrow_dir, 0],
+            vivid_coords[in_arrow_dir, 1],
+        ]   # shape (N, 3) RGB
+
+        if len(directed_pixels) < min_vivid_directed:
+            return None, True   # too few directed vivid pixels → treat as uncoloured
+
+        color = _hue_cluster_median(directed_pixels, min_count=8)
+        if color is not None:
+            print(f"      [ARROW] tip hex={rgb_to_hex(color)}"
+                  f"  vivid_in_dir={len(directed_pixels)}")
+        return color, True
 
     # ------------------------------------------------------------------
     # OCR with bbox tracking
@@ -1920,7 +2116,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 # ============================================================
 
 def main_with_legend():
-    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-2"
+    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-3"
     legend_path  = input("Enter path to ISO legend image: ").strip().strip("'\"")
     page_name    = input("Enter page name (e.g. ERCP_2): ").strip() or "ERCP_2"
 
