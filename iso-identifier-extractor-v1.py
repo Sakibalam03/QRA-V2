@@ -1456,6 +1456,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
         #   to accept a match means far-away identifiers are correctly rejected.
         extracted_color: Optional[tuple] = None
         used_margin = 0
+        dark_pipe_rejected = False
         bw_bbox = x2 - x1
         bh_bbox = y2 - y1
         # Determine true text orientation.
@@ -1488,6 +1489,77 @@ class ISOLineAssociator(TargetedPatchExtractor):
         # Raising the threshold to 90 excludes those edge pixels while keeping the
         # core CPP-03 pixels (S=116) and other well-saturated lines.
         s_thresh = 90 if is_portrait else 70
+        p0_spurious = False  # set True when Phase 0 spurious-bypass fires → skip Phase 0b
+
+        # ── Phase 0: arrow-based rejection ──────────────────────────────────
+        # Run BEFORE Phase 1 so that identifiers whose leader arrow points to an
+        # uncoloured pipe are excluded even when a coloured ISO line happens to
+        # fall within the Phase-1 proximity window.
+        #
+        # Key differences from Phase 2:
+        #   beyond_phase1_dist=0  — don't skip any vivid pixels; a short arrow to
+        #                           a coloured line (< 25 px) must still be found.
+        #   min_dark=10           — slightly tighter than Phase-2's 5 to reduce
+        #                           false triggers from scattered instrument marks.
+        #
+        # This call is REJECTION-ONLY: if the arrow tip is coloured we still let
+        # Phase 1 extract the precise legend colour; we only early-exit here when
+        # the arrow clearly leads to an uncoloured region.
+        p0_color, p0_arrow, p0_vivid_any = self._detect_and_follow_arrow(
+            img_rgb, x1, y1, x2, y2, img_h, img_w,
+            min_vivid_directed=(50 if is_portrait else 8),
+            beyond_phase1_dist=0,
+            # Portrait keeps min_dark=10 to avoid the ~28-vivid false-positive
+            # documented in the Phase-2 comment.  Landscape uses 5 to catch
+            # small arrowheads (e.g. a short leader with only 5-9 dark pixels).
+            min_dark=(10 if is_portrait else 5),
+            # Bidirectional check: for horizontal landscape arrows, require
+            # vivid colored pixels in the OPPOSITE direction too — an on-line
+            # identifier has the colored line extending both ways, but a branch
+            # identifier at a junction has it only on the junction side.
+            bidirectional_check=(not is_portrait),
+        )
+        if p0_arrow and p0_color is None:
+            if is_portrait:
+                # For portrait identifiers Phase 0 can mis-fire: the dark pixels
+                # that form the "arrow" are often from a nearby horizontal pipe,
+                # and the actual colored ISO line may be > 50 px away (beyond
+                # ARROW_MAX).  Don't reject here — let Phase 1/Phase 2 handle it.
+                print(f"      [ARROW-P0] portrait + arrow→uncoloured → skip rejection, let Phase 2 handle")
+                p0_arrow = False  # reset so PIPE-EDGE / LOOP-INSIDE don't gate on it
+            elif p0_vivid_any:
+                # Vivid pixels exist within ARROW_MAX but are NOT in the detected
+                # arrow direction.  This happens when the "arrow" is actually a
+                # dark pipe segment near the bbox (not a real leader arrow) — the
+                # centroid points toward the pipe, but the colored ISO line is
+                # accessible from a different direction via Phase 1.
+                # Example: 24"-NG-8191-D48 has dark pipe above → centroid UP, but
+                # CPP-08 orange is to the left/right within Phase-1 range.
+                print(f"      [ARROW-P0] landscape vivid-elsewhere → likely spurious arrow, let Phase 1 decide")
+                p0_arrow = False    # reset so guards don't gate on it
+                p0_spurious = True  # skip Phase 0b (same dark pixels, same false result)
+            else:
+                print(f"      [ARROW-P0] arrow→uncoloured → reject")
+                return None
+
+        # Phase 0b: re-try with a tighter ring (2–18 px, min_dark=3) to catch very
+        # short leader arrows (2–4 px from bbox boundary) that sit inside the
+        # standard ring_inner=5 exclusion zone and therefore escape Phase 0.
+        # Only run when Phase 0 found no arrow and the identifier is landscape.
+        if not p0_arrow and not is_portrait and not p0_spurious:
+            p0b_color, p0b_arrow, _ = self._detect_and_follow_arrow(
+                img_rgb, x1, y1, x2, y2, img_h, img_w,
+                min_vivid_directed=8,
+                beyond_phase1_dist=0,
+                min_dark=3,
+                ring_inner=2,
+                bidirectional_check=True,
+            )
+            if p0b_arrow and p0b_color is None:
+                print(f"      [ARROW-P0b] short arrow→uncoloured → reject")
+                return None
+            if p0b_arrow:
+                p0_arrow = True   # arrow confirmed colored; let Phase 1 determine precise color
 
         for margin in [8, 15, 25]:   # Phase 1: tight proximity search
             if is_portrait:
@@ -1535,7 +1607,133 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 used_margin     = margin
                 break
 
-        if extracted_color is None:
+        # ── Dark-pipe proximity guard ─────────────────────────────────────
+        # If a dark (uncoloured spur) pipe is closer to this bbox than
+        # used_margin/2, the identifier labels that spur, not the coloured
+        # ISO line found by Phase 1.  Applies to landscape always; for portrait
+        # also apply but only when Phase 1 found the colour (used_margin ≤ 25),
+        # not when Phase 2 matched a distant horizontal band (used_margin = 50).
+        if (extracted_color is not None and used_margin >= 8
+                and (not is_portrait or used_margin <= 25)):
+            pad  = 20
+            gx1  = max(0, x1 - pad);  gx2 = min(img_w, x2 + pad)
+            gy1  = max(0, y1 - pad);  gy2 = min(img_h, y2 + pad)
+            g_rgb = img_rgb[gy1:gy2, gx1:gx2]
+            g_hsv = cv2.cvtColor(g_rgb, cv2.COLOR_RGB2HSV)
+            dark_mask = (g_hsv[:, :, 2] < 50) & (g_hsv[:, :, 1] < 40)
+            # Exclude bbox interior
+            ry1b = y1 - gy1;  ry2b = y2 - gy1
+            rx1b = x1 - gx1;  rx2b = x2 - gx1
+            dark_mask[ry1b:ry2b, rx1b:rx2b] = False
+            if dark_mask.any():
+                ys_dp, xs_dp = np.where(dark_mask)
+                dr_dp = np.maximum(0, np.maximum(ry1b - ys_dp, ys_dp - (ry2b - 1)))
+                dc_dp = np.maximum(0, np.maximum(rx1b - xs_dp, xs_dp - (rx2b - 1)))
+                dist_dp = np.sqrt(dr_dp.astype(float) ** 2 + dc_dp.astype(float) ** 2)
+                far_enough = dist_dp >= 3.0   # skip text-bleed pixels
+                if far_enough.any():
+                    min_dp_dist = float(dist_dp[far_enough].min())
+                    threshold   = used_margin / 2.0
+                    print(f"      [LOCAL] dark_proxy: min_dp={min_dp_dist:.1f}px"
+                          f"  used_margin={used_margin}  threshold={threshold:.1f}")
+                    if min_dp_dist < threshold:
+                        print(f"      [LOCAL] dark pipe closer than coloured line"
+                              f" → spur label → reject")
+                        extracted_color = None
+                        dark_pipe_rejected = True
+
+        # ── Vertical-pipe-through check ──────────────────────────────────────
+        # For a landscape (horizontal) identifier, if the coloured ISO line runs
+        # VERTICALLY and passes THROUGH the text bbox, Phase 1 finds vivid pixels
+        # both ABOVE and BELOW the identifier in a narrow column range.  That
+        # geometry means the pipe crosses the text — the identifier does not label
+        # that pipe.  Detect: vivid pixels present above AND below the bbox, and
+        # their column span is less than half the identifier width.
+        if (extracted_color is not None and not is_portrait and used_margin == 8):
+            pad_vt = 8
+            gx1_vt = max(0, x1 - pad_vt); gx2_vt = min(img_w, x2 + pad_vt)
+            gy1_vt = max(0, y1 - pad_vt); gy2_vt = min(img_h, y2 + pad_vt)
+            vt_rgb = img_rgb[gy1_vt:gy2_vt, gx1_vt:gx2_vt]
+            vt_hsv = cv2.cvtColor(vt_rgb, cv2.COLOR_RGB2HSV)
+            vt_vivid = (vt_hsv[:, :, 1] > s_thresh) & (vt_hsv[:, :, 2] >= 60)
+            ry1_vt = y1 - gy1_vt; ry2_vt = y2 - gy1_vt
+            rx1_vt = x1 - gx1_vt; rx2_vt = x2 - gx1_vt
+            vt_vivid[ry1_vt:ry2_vt, rx1_vt:rx2_vt] = False
+            if vt_vivid.any():
+                ys_vt, xs_vt = np.where(vt_vivid)
+                vivid_above_vt = int((ys_vt < ry1_vt).sum())
+                vivid_below_vt = int((ys_vt >= ry2_vt).sum())
+                if vivid_above_vt > 20 and vivid_below_vt > 20:
+                    col_span_vt = int(xs_vt.max()) - int(xs_vt.min())
+                    id_w = x2 - x1
+                    print(f"      [VERT-THROUGH?] above={vivid_above_vt} below={vivid_below_vt}"
+                          f" col_span={col_span_vt} id_w={id_w}")
+                    if col_span_vt < id_w * 0.5:
+                        print(f"      [VERT-THROUGH] vertical ISO line through landscape"
+                              f" identifier → not relevant → reject")
+                        extracted_color = None
+                        dark_pipe_rejected = True
+
+        # ── Left/right edge pipe scan ────────────────────────────────────────
+        # After Phase 1 at margin=8: a dark spur pipe that starts at 1px from
+        # the bbox left/right edge would produce many dark pixels in a thin
+        # edge strip (proportional to identifier height).  Text edge bleed
+        # produces < 3 scattered pixels.  A genuine pipe crossing the full
+        # height would produce ≥ identifier_height/3 dark pixels.
+        # Only applies to landscape identifiers where no Phase 0/0b arrow found.
+        if (extracted_color is not None and not is_portrait
+                and used_margin == 8 and not p0_arrow):
+            identifier_h  = y2 - y1
+            min_pipe_px   = max(8, identifier_h // 3)
+            strip_w       = 2
+
+            def _count_dark_strip(arr: np.ndarray) -> int:
+                if arr.size == 0:
+                    return 0
+                hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+                return int(((hsv[:, :, 2] < 50) & (hsv[:, :, 1] < 40)).sum())
+
+            identifier_w = x2 - x1
+            lx1        = max(0, x1 - strip_w)
+            left_dark  = _count_dark_strip(img_rgb[y1:y2, lx1:x1])
+            rx2        = min(img_w, x2 + strip_w)
+            right_dark = _count_dark_strip(img_rgb[y1:y2, x2:rx2])
+            ty1        = max(0, y1 - strip_w)
+            top_dark   = _count_dark_strip(img_rgb[ty1:y1, x1:x2])
+            by2        = min(img_h, y2 + strip_w)
+            bot_dark   = _count_dark_strip(img_rgb[y2:by2, x1:x2])
+
+            if left_dark >= min_pipe_px or right_dark >= min_pipe_px:
+                print(f"      [PIPE-EDGE] L={left_dark} R={right_dark}"
+                      f" min_pipe_px={min_pipe_px} → dark pipe at edge → spur → reject")
+                return None
+
+            # Vivid-pixel directional check: if vivid pixels exist ONLY above the
+            # bbox (none below, none within 4px), the label is sitting below a
+            # colored line (inside a loop or spur junction) — not labeling it.
+            pad_v = 8
+            gx1v = max(0, x1 - pad_v); gx2v = min(img_w, x2 + pad_v)
+            gy1v = max(0, y1 - pad_v); gy2v = min(img_h, y2 + pad_v)
+            v_rgb = img_rgb[gy1v:gy2v, gx1v:gx2v]
+            v_hsv = cv2.cvtColor(v_rgb, cv2.COLOR_RGB2HSV)
+            v_vivid = (v_hsv[:, :, 1] > s_thresh) & (v_hsv[:, :, 2] >= 60)
+            ry1v = y1 - gy1v; ry2v = y2 - gy1v
+            rx1v = x1 - gx1v; rx2v = x2 - gx1v
+            v_vivid[ry1v:ry2v, rx1v:rx2v] = False
+            if v_vivid.any():
+                ys_v, xs_v = np.where(v_vivid)
+                dr_v = np.maximum(0, np.maximum(ry1v - ys_v, ys_v - (ry2v - 1)))
+                dc_v = np.maximum(0, np.maximum(rx1v - xs_v, xs_v - (rx2v - 1)))
+                dist_v = np.sqrt(dr_v.astype(float) ** 2 + dc_v.astype(float) ** 2)
+                vivid_count_close = int((dist_v < 4).sum())
+                vivid_above = int((ys_v < ry1v).sum())
+                vivid_below = int((ys_v >= ry2v).sum())
+                if vivid_above > 100 and vivid_below == 0 and vivid_count_close == 0:
+                    print(f"      [LOOP-INSIDE] vivid only above ({vivid_above}px)"
+                          f" → label inside loop / spur → reject")
+                    return None
+
+        if extracted_color is None and not dark_pipe_rejected:
             # ── Phase 2: leader-arrow detection ──────────────────────────
             # Phase 1 found no coloured pixels within 25 px.  Try to detect a
             # leader arrow departing from the text bbox and sample the coloured
@@ -1545,9 +1743,13 @@ class ISOLineAssociator(TargetedPatchExtractor):
             # portrait arrow (e.g. 24"-NG-8114-D48) produces only ~28 incidental
             # vivid pixels, while a real ISO line connected by a leader arrow
             # produces hundreds.  This threshold separates the two reliably.
-            arrow_color, arrow_detected = self._detect_and_follow_arrow(
+            arrow_color, arrow_detected, _ = self._detect_and_follow_arrow(
                 img_rgb, x1, y1, x2, y2, img_h, img_w,
                 min_vivid_directed=(50 if is_portrait else 8),
+                # Portrait leader arrows can reach a horizontal ISO band that is
+                # 100–200 px away from the identifier (e.g. 24"-NG-8191-D48 →
+                # CPP-08 ~181 px above).  Extend the search range for portrait.
+                arrow_max=(200 if is_portrait else 50),
             )
             if not arrow_detected:
                 return None   # no arrow found and Phase 1 also failed
@@ -1555,6 +1757,9 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 return None   # arrow found but tip is uncoloured → exclude
             extracted_color = arrow_color
             used_margin = 50  # indicative: colour found via leader arrow
+
+        if extracted_color is None:
+            return None   # dark_pipe_rejected with no Phase 2 fallback
 
         ex_h, ex_s, ex_v = rgb_to_hsv(extracted_color)
 
@@ -1682,6 +1887,11 @@ class ISOLineAssociator(TargetedPatchExtractor):
         img_h:  int,
         img_w:  int,
         min_vivid_directed: int = 8,
+        beyond_phase1_dist: int = 25,
+        min_dark: int = 5,
+        bidirectional_check: bool = False,
+        ring_inner: int = 5,
+        arrow_max: int = 50,
     ) -> Tuple[Optional[tuple], bool]:
         """
         Detect a leader arrow departing from the identifier text bbox and
@@ -1715,10 +1925,10 @@ class ISOLineAssociator(TargetedPatchExtractor):
         (None,  True)  — arrow detected, tip is uncoloured → caller should reject
         (None,  False) — no arrow detected → caller should fall through to Phase 1
         """
-        RING_INNER = 5     # px outside bbox where ring starts (skip anti-alias bleed)
+        RING_INNER = ring_inner  # px outside bbox where ring starts (skip anti-alias bleed)
         RING_OUTER = 18    # px outside bbox where ring ends
-        ARROW_MAX  = 50    # px: maximum arrow length to search
-        MIN_DARK   = 5     # minimum near-black pixels required to declare an arrow
+        ARROW_MAX  = arrow_max  # px: maximum arrow length to search
+        MIN_DARK   = min_dark   # minimum near-black pixels required to declare an arrow
         COS_THRESH = 0.50  # cos(60°) — vivid pixel must be within 60° of arrow dir
 
         # ── A: find near-black pixels in the ring ────────────────────────
@@ -1729,7 +1939,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         ring = img_rgb[ry1:ry2, rx1:rx2]
         if ring.size == 0:
-            return None
+            return None, False, False
 
         ring_hsv = cv2.cvtColor(ring, cv2.COLOR_RGB2HSV)
         # Near-black: dark value AND low saturation (avoids dark-coloured lines)
@@ -1745,7 +1955,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         dark_coords = np.argwhere(near_black)   # (row, col) in ring coords
         if len(dark_coords) < MIN_DARK:
-            return None, False   # no arrow detected
+            return None, False, False   # no arrow detected
 
         # ── B: arrow direction from dark-pixel centroid ──────────────────
         bbox_cy_r = (y1 + y2) / 2.0 - ry1   # bbox centre in ring coords
@@ -1756,7 +1966,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         mag = (dir_r ** 2 + dir_c ** 2) ** 0.5
         if mag < 2.0:
-            return None, False   # no clear directional bias
+            return None, False, False   # no clear directional bias
 
         arrow_dy = dir_r / mag   # row component (↓ positive)
         arrow_dx = dir_c / mag   # col component (→ positive)
@@ -1771,7 +1981,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         arrow_region = img_rgb[ay1:ay2, ax1:ax2]
         if arrow_region.size == 0:
-            return None, True   # arrow detected but region empty → treat as uncoloured
+            return None, True, False   # arrow detected but region empty → treat as uncoloured
 
         ar_hsv    = cv2.cvtColor(arrow_region, cv2.COLOR_RGB2HSV)
         vivid_mask = ar_hsv[:, :, 1] > 70
@@ -1779,7 +1989,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
         if len(vivid_coords) < 8:
             print(f"      [ARROW] no vivid pixels within {ARROW_MAX}px → reject")
-            return None, True   # arrow detected, tip is uncoloured
+            return None, True, False   # arrow detected, no vivid anywhere
 
         # Absolute coordinates of each vivid pixel
         pix_r = vivid_coords[:, 0].astype(float) + ay1
@@ -1793,11 +2003,13 @@ class ISOLineAssociator(TargetedPatchExtractor):
         pix_dist = np.sqrt(vec_r ** 2 + vec_c ** 2)
 
         # Distance from the nearest point on the bbox BOUNDARY (not centre).
-        # Pixels inside Phase-1 range (≤ 25 px from boundary) are skipped.
+        # Pixels inside beyond_phase1_dist px from the boundary are skipped
+        # when called from Phase 2 (avoids double-counting Phase-1 range).
+        # When called from Phase 0 (before Phase 1), pass 0 so all pixels count.
         nearest_r = np.clip(pix_r, y1, y2)
         nearest_c = np.clip(pix_c, x1, x2)
         dist_from_bbox = np.sqrt((pix_r - nearest_r) ** 2 + (pix_c - nearest_c) ** 2)
-        beyond_phase1 = dist_from_bbox > 25
+        beyond_phase1 = dist_from_bbox > beyond_phase1_dist
 
         # Cosine of angle between arrow direction and each pixel's direction
         cos_angle = (vec_r * arrow_dy + vec_c * arrow_dx) / np.maximum(pix_dist, 1.0)
@@ -1807,7 +2019,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
         if not in_arrow_dir.any():
             print(f"      [ARROW] vivid pixels present but none in arrow direction"
                   f" → arrow points to uncoloured line → reject")
-            return None, True   # arrow detected, tip is uncoloured
+            return None, True, True   # arrow detected, vivid exists but not in direction
 
         directed_pixels = arrow_region[
             vivid_coords[in_arrow_dir, 0],
@@ -1815,13 +2027,39 @@ class ISOLineAssociator(TargetedPatchExtractor):
         ]   # shape (N, 3) RGB
 
         if len(directed_pixels) < min_vivid_directed:
-            return None, True   # too few directed vivid pixels → treat as uncoloured
+            return None, True, True   # too few directed vivid pixels → vivid exists
+
+        # ── Bidirectional check (Phase-0 landscape only) ──────────────────
+        # A horizontal arrow on an identifier that is ON a colored line points
+        # along the line — vivid colored pixels exist in BOTH the arrow direction
+        # AND the opposite direction (the line continues both ways).
+        # A horizontal arrow on a BRANCH identifier points toward the junction;
+        # the pipe in the opposite direction is uncolored → vivid pixels exist
+        # ONLY in the arrow direction.  Detecting this asymmetry lets us reject
+        # the branch case even though the arrow tip appears colored.
+        if bidirectional_check and abs(arrow_dx) > 0.7:
+            opp_cos = (vec_r * (-arrow_dy) + vec_c * (-arrow_dx)) / np.maximum(pix_dist, 1.0)
+            # Adaptive limit: only look for opposite-direction vivid pixels within
+            # (min_forward_dist + 10) px of the bbox boundary.  This prevents distant
+            # incidental colored elements (from a different ISO line elsewhere in the
+            # patch) from incorrectly "passing" the bidirectional check — they would
+            # be much farther than the forward-direction pixels that hug the junction.
+            if in_arrow_dir.any():
+                min_fwd_dist  = float(dist_from_bbox[in_arrow_dir].min())
+                opp_dist_limit = max(min_fwd_dist + 10.0, 15.0)
+            else:
+                opp_dist_limit = 20.0
+            in_opp_dir = beyond_phase1 & (opp_cos >= COS_THRESH) & (dist_from_bbox <= opp_dist_limit)
+            if not in_opp_dir.any():
+                print(f"      [ARROW] horizontal arrow, no vivid opposite within"
+                      f" {opp_dist_limit:.0f}px → branch at junction → reject")
+                return None, True, True   # vivid exists in fwd direction at least
 
         color = _hue_cluster_median(directed_pixels, min_count=8)
         if color is not None:
             print(f"      [ARROW] tip hex={rgb_to_hex(color)}"
                   f"  vivid_in_dir={len(directed_pixels)}")
-        return color, True
+        return color, True, True
 
     # ------------------------------------------------------------------
     # OCR with bbox tracking
@@ -2187,6 +2425,9 @@ def main_with_legend():
     patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-2"
     legend_path  = input("Enter path to ISO legend image: ").strip().strip("'\"")
     page_name    = input("Enter page name (e.g. ERCP_2): ").strip() or "ERCP_2"
+    alt_folder   = input(f"Patch folder [{patch_folder}]: ").strip().strip("'\"")
+    if alt_folder:
+        patch_folder = alt_folder
 
     associator = ISOLineAssociator(patch_folder)
     associator.load_legend(legend_path)
