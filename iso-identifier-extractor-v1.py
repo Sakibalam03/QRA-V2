@@ -1519,13 +1519,22 @@ class ISOLineAssociator(TargetedPatchExtractor):
             # identifier at a junction has it only on the junction side.
             bidirectional_check=(not is_portrait),
         )
+        # Track whether Phase 0 detected a directional dark-pixel cluster before
+        # the bypass code can reset p0_arrow.  Used to gate portrait Phase 2:
+        # when Phase 0 found an arrow (dark_px ≥ min_dark=10), the "arrow" is
+        # usually from a nearby horizontal pipe, not a real leader — Phase 2 with
+        # its looser min_dark=5 would re-detect the same spurious direction and
+        # produce a false positive.  When Phase 0 found NO arrow (very few dark
+        # pixels around the bbox), Phase 2 can legitimately find a genuine weak
+        # short leader arrow (e.g. 8"-OW-8104-D03 with dark_px=8).
+        p0_found_arrow = p0_arrow
         if p0_arrow and p0_color is None:
             if is_portrait:
                 # For portrait identifiers Phase 0 can mis-fire: the dark pixels
                 # that form the "arrow" are often from a nearby horizontal pipe,
-                # and the actual colored ISO line may be > 50 px away (beyond
-                # ARROW_MAX).  Don't reject here — let Phase 1/Phase 2 handle it.
-                print(f"      [ARROW-P0] portrait + arrow→uncoloured → skip rejection, let Phase 2 handle")
+                # not a real leader arrow.  Don't reject here — let Phase 1 handle it.
+                # Phase 2 is disabled for portrait (see below) so only Phase 1 matters.
+                print(f"      [ARROW-P0] portrait + arrow→uncoloured → skip rejection, let Phase 1 handle")
                 p0_arrow = False  # reset so PIPE-EDGE / LOOP-INSIDE don't gate on it
             elif p0_vivid_any:
                 # Vivid pixels exist within ARROW_MAX but are NOT in the detected
@@ -1733,23 +1742,21 @@ class ISOLineAssociator(TargetedPatchExtractor):
                           f" → label inside loop / spur → reject")
                     return None
 
-        if extracted_color is None and not dark_pipe_rejected:
+        if extracted_color is None and not dark_pipe_rejected and not (is_portrait and p0_found_arrow):
             # ── Phase 2: leader-arrow detection ──────────────────────────
             # Phase 1 found no coloured pixels within 25 px.  Try to detect a
             # leader arrow departing from the text bbox and sample the coloured
             # ISO line at its tip (up to 50 px away).
-            # For portrait bboxes raise the minimum vivid-pixel count in the
-            # arrow direction to 50 (vs 8 for landscape).  A false-positive
-            # portrait arrow (e.g. 24"-NG-8114-D48) produces only ~28 incidental
-            # vivid pixels, while a real ISO line connected by a leader arrow
-            # produces hundreds.  This threshold separates the two reliably.
+            # Portrait guard: skip Phase 2 when Phase 0 already detected a dark-
+            # pixel directional cluster (p0_found_arrow=True).  That cluster is
+            # typically from a nearby horizontal pipe, not a real leader — Phase 2
+            # with its looser min_dark=5 would re-detect the same spurious direction
+            # and produce a false positive.  If Phase 0 found NO arrow (p0_found_arrow
+            # =False), Phase 2 may still find a genuine weak short leader (8"-OW-8104).
             arrow_color, arrow_detected, _ = self._detect_and_follow_arrow(
                 img_rgb, x1, y1, x2, y2, img_h, img_w,
                 min_vivid_directed=(50 if is_portrait else 8),
-                # Portrait leader arrows can reach a horizontal ISO band that is
-                # 100–200 px away from the identifier (e.g. 24"-NG-8191-D48 →
-                # CPP-08 ~181 px above).  Extend the search range for portrait.
-                arrow_max=(200 if is_portrait else 50),
+                arrow_max=50,
             )
             if not arrow_detected:
                 return None   # no arrow found and Phase 1 also failed
@@ -2422,7 +2429,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
 # ============================================================
 
 def main_with_legend():
-    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-2"
+    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-3"
     legend_path  = input("Enter path to ISO legend image: ").strip().strip("'\"")
     page_name    = input("Enter page name (e.g. ERCP_2): ").strip() or "ERCP_2"
     alt_folder   = input(f"Patch folder [{patch_folder}]: ").strip().strip("'\"")
