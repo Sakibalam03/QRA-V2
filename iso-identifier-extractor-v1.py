@@ -1862,6 +1862,22 @@ class ISOLineAssociator(TargetedPatchExtractor):
                     print(f"      [LOCAL] identical-color spread={dist_spread:.2f}"
                           f" → vivid tiebreaker → prefer {winner} over {best_name}")
                 best_name = winner
+                # Landscape guard: when all candidates share the same HSV colour,
+                # the vivid tiebreaker blindly picks the dominant legend entry
+                # (usually the large solid main pipe) even if the local strip
+                # looks dashed — which happens when the identifier sits next to
+                # an uncoloured dashed spur/stub rather than on the coloured line
+                # itself.  If the local strip is dashed, the winner is solid, and
+                # there is no confirmed Phase-0 arrow pointing toward the winner,
+                # the identifier almost certainly labels the uncoloured spur.
+                # Portrait identifiers are excluded: the vertical spread check
+                # (≥50% vivid rows) already confirms they ARE on the coloured line.
+                if (not is_portrait and not p0_arrow and not p0_spurious
+                        and local_pattern == 'dashed'
+                        and self.iso_color_map.get(winner, {}).get('pattern') == 'solid'):
+                    print(f"      [LOCAL] landscape no-arrow: dashed local strip"
+                          f" vs solid ISO → likely spur label → reject")
+                    return None
             elif local_pattern != 'unknown':
                 pattern_matches = [
                     (name, dist) for name, dist in tied
