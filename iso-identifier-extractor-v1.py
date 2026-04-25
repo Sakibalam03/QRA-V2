@@ -1210,6 +1210,11 @@ class ISOLineAssociator(TargetedPatchExtractor):
         # A connected component must span at least this many pixels in one
         # axis to be counted as a real drawn line (not isolated noise)
         self.min_line_span_px = min_line_span_px
+        # Identifiers vetoed by VERT-THROUGH in any patch of the current page.
+        # A VERT-THROUGH rejection means the coloured pipe passes vertically
+        # through the identifier bbox — the identifier doesn't label that pipe.
+        # Populated during per-patch processing; reset at the start of each page.
+        self._vert_through_vetoes: Set[str] = set()
 
     # ------------------------------------------------------------------
     # Legend loading
@@ -1402,11 +1407,12 @@ class ISOLineAssociator(TargetedPatchExtractor):
 
     def _find_iso_line_by_local_color(
         self,
-        bbox:    tuple,
-        img_rgb: np.ndarray,
-        img_h:   int,
-        img_w:   int,
-        polygon: Optional[list] = None,
+        bbox:       tuple,
+        img_rgb:    np.ndarray,
+        img_h:      int,
+        img_w:      int,
+        polygon:    Optional[list] = None,
+        identifier: Optional[str]  = None,
     ) -> Optional[str]:
         """
         Associate an ISO identifier with a legend entry by sampling the
@@ -1570,7 +1576,14 @@ class ISOLineAssociator(TargetedPatchExtractor):
             if p0b_arrow:
                 p0_arrow = True   # arrow confirmed colored; let Phase 1 determine precise color
 
-        for margin in [8, 15, 25]:   # Phase 1: tight proximity search
+        # When p0_spurious=True (arrow detected toward uncoloured, vivid elsewhere),
+        # Phase 0 already confirmed the real arrow direction is NOT toward the
+        # coloured line.  The coloured line is "elsewhere" but only reachable at
+        # margin=15/25 — meaning the identifier is not directly adjacent to it.
+        # Restrict to margin=8 only so we don't pick up a distant background line.
+        # (24"-NG-8191-D48, which IS on the coloured line, still finds it at margin=8.)
+        phase1_margins = [8] if p0_spurious else [8, 15, 25]
+        for margin in phase1_margins:   # Phase 1: tight proximity search
             if is_portrait:
                 # Vertical text beside a vertical line → expand only L/R.
                 # Horizontal lines above/below the text are NOT the target line.
@@ -1680,6 +1693,8 @@ class ISOLineAssociator(TargetedPatchExtractor):
                     if col_span_vt < id_w * 0.5:
                         print(f"      [VERT-THROUGH] vertical ISO line through landscape"
                               f" identifier → not relevant → reject")
+                        if identifier:
+                            self._vert_through_vetoes.add(identifier)
                         extracted_color = None
                         dark_pipe_rejected = True
 
@@ -2279,6 +2294,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
                 iso_line = self._find_iso_line_by_local_color(
                     bbox, img_rgb, img_h, img_w,
                     polygon=partial.get('polygon'),
+                    identifier=identifier,
                 )
                 if iso_line:
                     color_info = self.iso_color_map[iso_line]
@@ -2334,7 +2350,7 @@ class ISOLineAssociator(TargetedPatchExtractor):
         for identifier, bbox in identifier_bbox_map.items():
             polygon = identifier_polygon_map.get(identifier)
             iso_line = self._find_iso_line_by_local_color(
-                bbox, img_rgb, img_h, img_w, polygon=polygon
+                bbox, img_rgb, img_h, img_w, polygon=polygon, identifier=identifier
             )
             if iso_line:
                 color_info = self.iso_color_map[iso_line]
@@ -2393,6 +2409,9 @@ class ISOLineAssociator(TargetedPatchExtractor):
         patch_files = sorted(self.patch_folder.glob(f"{page_name}_r*_c*.png"))
         print(f"\nFound {len(patch_files)} patches\n")
 
+        # Reset per-page VERT-THROUGH vetoes before processing this page's patches
+        self._vert_through_vetoes = set()
+
         all_associations: List[Tuple[str, str, dict]] = []
         processed = 0
         skipped   = 0
@@ -2413,6 +2432,22 @@ class ISOLineAssociator(TargetedPatchExtractor):
             if key not in seen:
                 seen.add(key)
                 unique_associations.append((identifier, iso_line, color_info))
+
+        # Apply cross-patch VERT-THROUGH vetoes: if VERT-THROUGH fired for an
+        # identifier in ANY patch of this page, remove its association everywhere.
+        # This overrides an earlier-patch Phase-1 acceptance that happened before
+        # VERT-THROUGH could fire (the golden pipe wasn't visible in that patch).
+        if self._vert_through_vetoes:
+            before = len(unique_associations)
+            unique_associations = [
+                (ident, iso_line, color_info)
+                for ident, iso_line, color_info in unique_associations
+                if ident not in self._vert_through_vetoes
+            ]
+            removed = before - len(unique_associations)
+            if removed:
+                print(f"\n  [VETO] VERT-THROUGH cross-patch veto removed {removed} association(s):"
+                      f" {sorted(self._vert_through_vetoes)}")
 
         return {
             'page_name':        page_name,
