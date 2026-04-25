@@ -2429,12 +2429,30 @@ class ISOLineAssociator(TargetedPatchExtractor):
 # ============================================================
 
 def main_with_legend():
-    patch_folder = r"E:\Projects\P&ID Versions\P&ID V2\test-node1.4-patches-pg-3"
+    import re
+    import csv
+
     legend_path  = input("Enter path to ISO legend image: ").strip().strip("'\"")
-    page_name    = input("Enter page name (e.g. ERCP_2): ").strip() or "ERCP_2"
-    alt_folder   = input(f"Patch folder [{patch_folder}]: ").strip().strip("'\"")
-    if alt_folder:
-        patch_folder = alt_folder
+    patch_folder = input("Enter path to multi-page patch folder: ").strip().strip("'\"")
+
+    patch_folder_path = Path(patch_folder)
+    if not patch_folder_path.is_dir():
+        print(f"\nERROR: Folder not found: {patch_folder}")
+        return
+
+    # Auto-detect all page names from patch filenames (ERCP_{N}_r{row}_c{col}.png)
+    page_names = set()
+    for f in patch_folder_path.glob("*.png"):
+        m = re.match(r'^(ERCP_\d+)_r\d+_c\d+\.png$', f.name)
+        if m:
+            page_names.add(m.group(1))
+
+    if not page_names:
+        print("\nERROR: No patch files matching ERCP_*_r*_c*.png found in folder.")
+        return
+
+    page_names = sorted(page_names, key=lambda x: int(x.split('_')[1]))
+    print(f"\nDetected {len(page_names)} pages: {', '.join(page_names)}")
 
     associator = ISOLineAssociator(patch_folder)
     associator.load_legend(legend_path)
@@ -2443,41 +2461,74 @@ def main_with_legend():
         print("\nERROR: No legend colors loaded. Cannot proceed.")
         return
 
-    results = associator.process_page_with_associations(page_name)
+    # Process each page and collect all associations with page info
+    # Each entry: (iso_line, page_name, identifier, pattern, hex_color)
+    all_entries: List[Tuple[str, str, str, str, str]] = []
+    total_patches = 0
+    total_processed = 0
+    total_skipped = 0
+
+    for page_name in page_names:
+        results = associator.process_page_with_associations(page_name)
+        total_patches   += results['total_patches']
+        total_processed += results['processed_patches']
+        total_skipped   += results['skipped_patches']
+        for identifier, iso_line, color_info in results['associations']:
+            pattern   = color_info.get('pattern', 'unknown')
+            hex_color = color_info['hex']
+            all_entries.append((iso_line, page_name, identifier, pattern, hex_color))
+
+    # Deduplicate across pages: keep first occurrence of (iso_line, page, identifier)
+    seen: set = set()
+    unique_entries: List[Tuple[str, str, str, str, str]] = []
+    for entry in all_entries:
+        key = (entry[0], entry[1], entry[2])
+        if key not in seen:
+            seen.add(key)
+            unique_entries.append(entry)
+
+    # Sort: by ISO line, then by page number, then by identifier
+    unique_entries.sort(key=lambda e: (e[0], int(e[1].split('_')[1]), e[2]))
 
     # ── Print results ────────────────────────────────────────────────────
     print("\n" + "=" * 80)
     print("FINAL RESULTS  —  ISO IDENTIFIER → ISO LINE ASSOCIATIONS")
     print("=" * 80)
-    print(f"\nPage             : {results['page_name']}")
-    print(f"Total patches    : {results['total_patches']}")
-    print(f"  Processed      : {results['processed_patches']}  (had colored lines)")
-    print(f"  Skipped        : {results['skipped_patches']}  (no colored lines — OCR skipped)")
-    print(f"\nTotal associations: {results['total_found']}\n")
+    print(f"\nPages processed  : {len(page_names)}  ({page_names[0]} → {page_names[-1]})")
+    print(f"Total patches    : {total_patches}")
+    print(f"  Processed      : {total_processed}  (had colored lines)")
+    print(f"  Skipped        : {total_skipped}  (no colored lines — OCR skipped)")
+    print(f"\nTotal associations: {len(unique_entries)}\n")
 
-    if results['associations']:
+    if unique_entries:
         col_w = 27
-        print(f"{'ISO Identifier':<{col_w}} {'ISO Line':<22} {'Pattern':<10} Color")
-        print("-" * 72)
-        for identifier, iso_line, color_info in sorted(results['associations']):
-            pattern   = color_info.get('pattern', 'unknown')
-            hex_color = color_info['hex']
-            print(f"{identifier:<{col_w}} {iso_line:<22} {pattern:<10} {hex_color}")
+        print(f"{'ISO Line':<22} {'Page':<10} {'ISO Identifier':<{col_w}} {'Pattern':<10} Color")
+        print("-" * 80)
+        current_iso = None
+        for iso_line, page_name, identifier, pattern, hex_color in unique_entries:
+            if iso_line != current_iso:
+                if current_iso is not None:
+                    print()
+                current_iso = iso_line
+            print(f"{iso_line:<22} {page_name:<10} {identifier:<{col_w}} {pattern:<10} {hex_color}")
     else:
         print("  No associations found.")
 
     print("\n" + "=" * 80)
-    return results
+
+    # ── Write CSV ────────────────────────────────────────────────────────
+    script_dir = Path(__file__).parent
+    csv_path   = script_dir / "iso_associations.csv"
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(["ISO Line", "Page", "ISO Identifier", "Pattern", "Color (Hex)"])
+        for iso_line, page_name, identifier, pattern, hex_color in unique_entries:
+            writer.writerow([iso_line, page_name, identifier, pattern, hex_color])
+
+    print(f"\nCSV saved to: {csv_path}")
+    return unique_entries
 
 
 if __name__ == "__main__":
     check_cuda()
-    print("\nSelect mode:")
-    print("  1. Extract ISO identifiers only (original)")
-    print("  2. Extract ISO identifiers + associate with ISO lines (new)")
-    mode = input("Mode (1/2): ").strip()
-
-    if mode == '2':
-        main_with_legend()
-    else:
-        main()
+    main_with_legend()
