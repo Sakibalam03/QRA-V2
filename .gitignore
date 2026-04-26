@@ -5,9 +5,9 @@ P&ID PDF's
 legends-sheets
 color_regions
 legend_debug.png
-.claude
 iso-identifier-single-page.py
 image-prompt-draw-box.py
 yoloe-11s-seg.pt
 refs/actuated_ref.png
 refs/manual_ref.png
+.claude
