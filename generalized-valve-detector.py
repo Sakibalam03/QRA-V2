@@ -1,17 +1,23 @@
 """
-Generalized Valve Detector
---------------------------
-Detects manual and actuated valves in P&ID patches using YOLOE SAVPE
-(visual prompt mode). Reference images are full P&ID patches with bboxes
-drawn around complete valve symbols in context (black outlines + colored
-body + adjacent pipe) — not tight colored-blob crops.
+P&ID Valve Detector — Geometry-Based (no ML, no training)
+----------------------------------------------------------
+Algorithm:
+  1. Extract colored pipe mask via HSV thresholding.
+  2. Dilate pipe mask into an envelope that covers valve symbols
+     embedded in the pipe (valve symbols break the colored region).
+  3. Find dark (black) connected components WITHIN the envelope —
+     these are the geometric valve symbols.
+  4. Filter by area, aspect ratio, size, and proximity to pipe.
+  5. NMS to deduplicate overlapping hits on the same symbol.
+
+Works for all valve types and orientations with zero references.
+No YOLOE / no training required for detection.
+
+Classification (manual vs actuated) can be layered on top once
+detection is reliable — see CLASSIFY section at bottom.
 
 Usage:
     python generalized-valve-detector.py <patch_dir> <output_dir>
-
-To add more reference examples (improves recall):
-    python image-prompt-draw-box.py <any_patch_with_a_valve.png>
-    → copy the printed bbox into REFS below as a new entry with the right cls
 """
 
 import argparse
@@ -19,169 +25,158 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from ultralytics import YOLOE
-from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
 
 # ---------------------------------------------------------------------------
-# Config
+# Pipe color ranges  (HSV — tweak lo/hi if your drawing uses different hues)
 # ---------------------------------------------------------------------------
 
-MODEL = "yoloe-11s-seg.pt"
-CONF  = 0.02   # SAVPE confidence on P&ID line art sits at 0.01–0.06
-
-# Each entry is one reference example. Add more entries per class to improve
-# recall — more visual diversity = more valve subtypes recognised.
-# Run image-prompt-draw-box.py to get new (image, bbox) pairs.
-REFS = [
-    # ── manual valves (class 0) ──────────────────────────────────────────
-    {"cls": 0, "image": "refs/manual_ref.png",   "bbox": [203, 443, 234, 494]},
-    # {"cls": 0, "image": "refs/manual_ref2.png",  "bbox": [x1, y1, x2, y2]},  # gate valve variant
-    # {"cls": 0, "image": "refs/manual_ref3.png",  "bbox": [x1, y1, x2, y2]},  # globe valve variant
-
-    # ── actuated valves (class 1) ────────────────────────────────────────
-    {"cls": 1, "image": "refs/actuated_ref.png", "bbox": [1, 276, 114, 368]},
-    # {"cls": 1, "image": "refs/actuated_ref2.png","bbox": [x1, y1, x2, y2]},
+PIPE_HSV = [
+    ((15,  80,  80), (38, 255, 255)),   # yellow  H ≈ 20–35
+    (( 5, 100,  80), (15, 255, 255)),   # orange  H ≈ 8–15
 ]
 
-CLASS_NAMES  = {0: "manual", 1: "actuated"}
-CLASS_COLORS = {0: (34, 197, 94), 1: (30, 144, 255)}   # green / blue (BGR)
-
-# Color gate
-SAT_THRESH  = 50
-COLOR_RATIO = 0.08   # full-bbox color ratio
-
-# Bbox shape/size gate
-MIN_SIDE = 15    # px
-MAX_SIDE = 220   # px
-MAX_AR   = 4.0   # long/short ratio
-
-# NMS — suppresses duplicate boxes that land on the same valve symbol
-IOU_THRESH = 0.35
+# Dilation applied to the pipe mask to create an envelope that spans valve
+# symbols which interrupt the colored band.  Increase if large actuated-valve
+# actuator boxes are being missed.
+PIPE_DILATE = 40   # px
 
 # ---------------------------------------------------------------------------
-# Reference builder
+# Dark-component (valve symbol) geometry filters
 # ---------------------------------------------------------------------------
 
-def build_reference():
-    """Stack all reference patches side-by-side into one SAVPE canvas."""
-    images, bboxes, cls_ids = [], [], []
-    x_offset = 0
-    for entry in REFS:
-        img = cv2.imread(entry["image"])
-        if img is None:
-            raise FileNotFoundError(f"Reference image not found: {entry['image']}")
-        x1, y1, x2, y2 = entry["bbox"]
-        images.append(img)
-        bboxes.append([x1 + x_offset, y1, x2 + x_offset, y2])
-        cls_ids.append(entry["cls"])
-        x_offset += img.shape[1]
+DARK_THRESH     = 140   # grayscale below this = "dark symbol pixel"
+MIN_AREA        = 150   # px²  — filters single text chars & noise
+MAX_AREA        = 9000  # px²  — filters large connected regions
+MIN_SIDE        = 15    # px   — smaller than this = probably a character
+MAX_SIDE        = 160   # px   — larger than this = not a single valve symbol
+MAX_AR          = 4.0   # long/short — rejects elongated pipe borders & text lines
+MIN_PIPE_PX     = 80    # colored pixels required within a 20 px pad around bbox
 
-    max_h  = max(i.shape[0] for i in images)
-    canvas = np.full((max_h, x_offset, 3), 255, dtype=np.uint8)
-    x = 0
-    for img in images:
-        h, w = img.shape[:2]
-        canvas[:h, x:x + w] = img
-        x += w
-
-    return canvas, np.array(bboxes, dtype=np.float32), np.array(cls_ids, dtype=np.int32)
+# Pipe-crossing gate: valve symbols SPAN the pipe (pipe enters from one side
+# and exits the opposite).  Instrument circles are connected from ONE side only.
+# We look CROSS_PAD px outside the bbox on each of the four sides and require
+# that opposite pairs (left+right OR top+bottom) both see colored pipe pixels.
+CROSS_PAD    = 25   # px outside bbox to sample for crossing pipe
+MIN_CROSS_PX = 6    # colored pixels required on EACH side of the crossing pair
 
 # ---------------------------------------------------------------------------
-# Filters
+# NMS & display
 # ---------------------------------------------------------------------------
 
-def _sat_ratio(image, x1, y1, x2, y2):
-    roi = image[y1:y2, x1:x2]
-    if roi.size == 0:
-        return 0.0
-    sat = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)[:, :, 1]
-    return float((sat > SAT_THRESH).mean())
+IOU_THRESH  = 0.35
+VALVE_COLOR = (34, 197, 94)   # green  — undifferentiated "valve" label
+
+# ---------------------------------------------------------------------------
+# Pipe mask helpers
+# ---------------------------------------------------------------------------
+
+def get_pipe_mask(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    for lo, hi in PIPE_HSV:
+        mask |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+    return mask
 
 
-def is_colored(image, x1, y1, x2, y2):
-    """Full bbox must have enough color."""
-    return _sat_ratio(image, x1, y1, x2, y2) >= COLOR_RATIO
+def get_pipe_envelope(pipe_mask: np.ndarray) -> np.ndarray:
+    k = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * PIPE_DILATE + 1, 2 * PIPE_DILATE + 1)
+    )
+    return cv2.dilate(pipe_mask, k)
 
+# ---------------------------------------------------------------------------
+# Core detector
+# ---------------------------------------------------------------------------
 
-def center_is_colored(image, x1, y1, x2, y2):
-    """Inner 50% of bbox must also have color — rejects label boxes that only clip a pipe edge."""
-    pad_x = (x2 - x1) // 4
-    pad_y = (y2 - y1) // 4
-    cx1, cy1 = x1 + pad_x, y1 + pad_y
-    cx2, cy2 = x2 - pad_x, y2 - pad_y
-    if cx2 <= cx1 or cy2 <= cy1:
-        return True  # bbox too small to sub-crop — defer to outer check
-    return _sat_ratio(image, cx1, cy1, cx2, cy2) >= COLOR_RATIO
+def detect_valve_symbols(image: np.ndarray) -> list:
+    """
+    Return list of (x1, y1, x2, y2) bboxes for dark geometric symbols
+    that sit on the colored pipe — i.e., valve symbols.
+    """
+    pipe_mask = get_pipe_mask(image)
+    if not pipe_mask.any():
+        return []
 
+    envelope = get_pipe_envelope(pipe_mask)
 
-def passes_shape(x1, y1, x2, y2):
-    w, h = x2 - x1, y2 - y1
-    if w < MIN_SIDE or h < MIN_SIDE:
-        return False
-    if w > MAX_SIDE or h > MAX_SIDE:
-        return False
-    ar = max(w, h) / max(min(w, h), 1)
-    return ar <= MAX_AR
+    # Dark pixels inside the pipe envelope
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    dark_in_env = np.zeros_like(gray)
+    dark_in_env[(gray < DARK_THRESH) & (envelope > 0)] = 255
 
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        dark_in_env, connectivity=8
+    )
 
-def nms(detections):
-    """detections: list of [x1,y1,x2,y2,cls_id,conf]. Returns pruned list."""
-    if len(detections) <= 1:
-        return detections
-    detections.sort(key=lambda d: d[5], reverse=True)
+    ih, iw = image.shape[:2]
+    candidates = []
+
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if not (MIN_AREA <= area <= MAX_AREA):
+            continue
+
+        x  = int(stats[i, cv2.CC_STAT_LEFT])
+        y  = int(stats[i, cv2.CC_STAT_TOP])
+        w  = int(stats[i, cv2.CC_STAT_WIDTH])
+        h  = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+        # Size gate
+        if w < MIN_SIDE or h < MIN_SIDE or w > MAX_SIDE or h > MAX_SIDE:
+            continue
+
+        # Aspect-ratio gate (rejects elongated pipe borders)
+        if max(w, h) / max(min(w, h), 1) > MAX_AR:
+            continue
+
+        # Proximity gate: colored pipe must exist near the component
+        pad  = 20
+        rx1  = max(0,  x - pad);  ry1 = max(0,  y - pad)
+        rx2  = min(iw, x + w + pad); ry2 = min(ih, y + h + pad)
+        pipe_near = int(pipe_mask[ry1:ry2, rx1:rx2].sum()) // 255
+        if pipe_near < MIN_PIPE_PX:
+            continue
+
+        # Pipe-crossing gate: pipe must enter from TWO opposite sides.
+        # Valves span the pipe; instrument circles connect from one side only.
+        lp = int(pipe_mask[y:y+h, max(0, x-CROSS_PAD):x          ].sum()) // 255
+        rp = int(pipe_mask[y:y+h, x+w:min(iw, x+w+CROSS_PAD)     ].sum()) // 255
+        tp = int(pipe_mask[max(0, y-CROSS_PAD):y,    x:x+w        ].sum()) // 255
+        bp = int(pipe_mask[y+h:min(ih, y+h+CROSS_PAD), x:x+w      ].sum()) // 255
+
+        h_cross = lp >= MIN_CROSS_PX and rp >= MIN_CROSS_PX
+        v_cross = tp >= MIN_CROSS_PX and bp >= MIN_CROSS_PX
+        if not (h_cross or v_cross):
+            continue
+
+        candidates.append((x, y, x + w, y + h))
+
+    return candidates
+
+# ---------------------------------------------------------------------------
+# NMS
+# ---------------------------------------------------------------------------
+
+def nms(boxes: list) -> list:
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
     keep = []
-    for det in detections:
-        x1, y1, x2, y2 = det[:4]
-        suppress = False
+    for b in boxes:
+        x1, y1, x2, y2 = b
+        ok = True
         for k in keep:
-            kx1, ky1, kx2, ky2 = k[:4]
-            iw = max(0, min(x2, kx2) - max(x1, kx1))
-            ih = max(0, min(y2, ky2) - max(y1, ky1))
-            inter = iw * ih
+            kx1, ky1, kx2, ky2 = k
+            iw_ = max(0, min(x2, kx2) - max(x1, kx1))
+            ih_ = max(0, min(y2, ky2) - max(y1, ky1))
+            inter = iw_ * ih_
             union = (x2-x1)*(y2-y1) + (kx2-kx1)*(ky2-ky1) - inter
             if union > 0 and inter / union > IOU_THRESH:
-                suppress = True
+                ok = False
                 break
-        if not suppress:
-            keep.append(det)
+        if ok:
+            keep.append(b)
     return keep
-
-# ---------------------------------------------------------------------------
-# Annotation
-# ---------------------------------------------------------------------------
-
-def draw_boxes(image, result):
-    out = image.copy()
-    raw = 0 if result.boxes is None else len(result.boxes)
-
-    if raw == 0:
-        return out, 0, 0
-
-    # Collect candidates that pass shape + color checks
-    candidates = []
-    for box in result.boxes:
-        x1, y1, x2, y2 = map(int, box.xyxy[0])
-        if not passes_shape(x1, y1, x2, y2):
-            continue
-        if not is_colored(image, x1, y1, x2, y2):
-            continue
-        if not center_is_colored(image, x1, y1, x2, y2):
-            continue
-        candidates.append([x1, y1, x2, y2, int(box.cls[0]), float(box.conf[0])])
-
-    # NMS across all classes
-    kept_boxes = nms(candidates)
-
-    for x1, y1, x2, y2, cls_id, conf in kept_boxes:
-        color = CLASS_COLORS.get(cls_id, (180, 180, 180))
-        label = f"{CLASS_NAMES.get(cls_id, str(cls_id))} {conf:.2f}"
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(out, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-
-    return out, raw, len(kept_boxes)
 
 # ---------------------------------------------------------------------------
 # Main
@@ -197,46 +192,54 @@ def run(patch_dir, output_dir):
         print(f"No images found in {patch_dir}")
         return
 
-    print(f"Patches      : {len(patches)}")
-    print(f"References   : {len(REFS)} ({sum(1 for r in REFS if r['cls']==0)} manual, "
-          f"{sum(1 for r in REFS if r['cls']==1)} actuated)")
-
-    canvas, bboxes, cls_ids = build_reference()
-    visual_prompts = dict(bboxes=bboxes, cls=cls_ids)
-
-    model = YOLOE(MODEL)
-
-    # First call bakes VPE into model.model; cache predictor to avoid 64× banner.
-    first = cv2.imread(str(patches[0]))
-    model.predict(
-        first,
-        refer_image=canvas,
-        visual_prompts=visual_prompts,
-        predictor=YOLOEVPSegPredictor,
-        conf=CONF,
-        verbose=False,
-    )
-    predictor = model.predictor
-
+    print(f"Patches: {len(patches)}")
     saved = 0
+
     for path in patches:
         img = cv2.imread(str(path))
         if img is None:
             continue
 
-        results              = predictor(source=img, stream=False)
-        annotated, raw, kept = draw_boxes(img, results[0])
+        boxes = nms(detect_valve_symbols(img))
 
-        if kept > 0:
-            cv2.imwrite(str(output_dir / path.name), annotated)
+        out = img.copy()
+        for x1, y1, x2, y2 in boxes:
+            cv2.rectangle(out, (x1, y1), (x2, y2), VALVE_COLOR, 2)
+            label = "valve"
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            cv2.rectangle(out, (x1, y1 - th - 4), (x1 + tw + 4, y1), VALVE_COLOR, -1)
+            cv2.putText(out, label, (x1 + 2, y1 - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+        if boxes:
+            cv2.imwrite(str(output_dir / path.name), out)
             saved += 1
-        status = f"raw={raw} kept={kept}"
-        if raw > kept:
-            status += f" filtered={raw - kept}"
-        print(f"  {path.name}: {status}")
+        print(f"  {path.name}: {len(boxes)} detections")
 
     print(f"\nDone — {saved}/{len(patches)} patches saved → {output_dir}")
 
+# ---------------------------------------------------------------------------
+# CLASSIFY — layer this on top once detection is reliable
+# ---------------------------------------------------------------------------
+# To distinguish manual vs actuated without training:
+#
+#   Option A — Geometry:
+#     Actuated valves have an actuator box above/below the valve body.
+#     They are typically larger vertically (h > 60px in a 640px patch).
+#     A simple height threshold separates most cases:
+#       cls = "actuated" if (y2-y1) > ACTUATED_MIN_HEIGHT else "manual"
+#
+#   Option B — YOLOE SAVPE as classifier (not detector):
+#     For each detected bbox, extract a 96×96 crop and run SAVPE
+#     with 1 reference per class (clean embedding, small search space).
+#     SAVPE on a known candidate is a binary classification problem —
+#     much more reliable than open-field detection.
+#
+#   Option C — Template matching:
+#     Maintain small 30×30 templates for each valve subtype.
+#     Match against each detected bbox crop.
+#     cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()

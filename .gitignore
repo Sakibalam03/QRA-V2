@@ -11,3 +11,5 @@ yoloe-11s-seg.pt
 refs/actuated_ref.png
 refs/manual_ref.png
 .claude
+iso-line-tracer-v1.py
+iso-mapped-line-tracer.py
